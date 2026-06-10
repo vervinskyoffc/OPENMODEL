@@ -1,6 +1,11 @@
-import sqlite3, os, time, sys, requests, platform, json, io, subprocess, re, shutil, threading, textwrap
+import sqlite3, os, time, sys, requests, platform, json, io, subprocess, re, shutil, threading, textwrap, shlex, queue, signal
 from pathlib import Path
 from datetime import datetime
+
+HOST_OS = platform.system() or "Unknown"
+IS_WINDOWS = HOST_OS == "Windows"
+IS_LINUX = HOST_OS == "Linux"
+IS_MACOS = HOST_OS == "Darwin"
 
 # ─── Optional: prompt_toolkit for proper input wrap/indent ────────────────────
 try:
@@ -11,7 +16,7 @@ except ImportError:
     _HAS_PT = False
 
 # ─── Windows UTF-8 + VT100 ANSI fix ─────────────────────────────────────────
-if platform.system() == "Windows":
+if IS_WINDOWS:
     # Step 1: Enable VT processing FIRST, before any stdout wrapping.
     # ENABLE_PROCESSED_OUTPUT            = 0x0001
     # ENABLE_WRAP_AT_EOL_OUTPUT          = 0x0002
@@ -48,22 +53,23 @@ ITALIC = "\033[3m"
 def rgb(r, g, b):    return f"\033[38;2;{r};{g};{b}m"
 def bg_rgb(r, g, b): return f"\033[48;2;{r};{g};{b}m"
 
-C_WHITE   = rgb(218, 218, 224)
-C_GRAY    = rgb(115, 115, 132)
-C_DIM_C   = rgb(50,  50,  60)
-C_ACCENT  = rgb(92,  158, 255)
-C_ACCENT2 = rgb(180, 128, 255)
-C_GREEN   = rgb(78,  205, 110)
-C_RED     = rgb(248, 75,  75)
-C_YELLOW  = rgb(250, 200, 62)
-C_ORANGE  = rgb(248, 152, 52)
-C_TEAL    = rgb(68,  200, 182)
+C_WHITE   = rgb(226, 232, 240)
+C_GRAY    = rgb(148, 163, 184)
+C_DIM_C   = rgb(55,  65,  81)
+C_ACCENT  = rgb(56,  189, 248)
+C_ACCENT2 = rgb(167, 139, 250)
+C_GREEN   = rgb(34,  197, 94)
+C_RED     = rgb(248, 113, 113)
+C_YELLOW  = rgb(250, 204, 21)
+C_ORANGE  = rgb(251, 146, 60)
+C_TEAL    = rgb(45,  212, 191)
+C_BLUE    = rgb(96,  165, 250)
 
-BG_PANEL  = bg_rgb(22, 22, 28)
-BG_STATUS = bg_rgb(14, 14, 20)
-BG_CODE   = bg_rgb(18, 20, 30)
+BG_PANEL  = bg_rgb(20, 22, 26)
+BG_STATUS = bg_rgb(13, 17, 23)
+BG_CODE   = bg_rgb(9,  25, 29)
 
-VERSION = "v2.1"
+VERSION = "v2.2-linux"
 
 # ─── Terminal helpers ──────────────────────────────────────────────────────────
 def tw():
@@ -77,6 +83,29 @@ def strip_ansi(s):
 
 def vis_len(s):
     return len(strip_ansi(s))
+
+def ellipsize(text, max_len):
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    if max_len <= 1:
+        return '…'
+    return '…' + text[-(max_len - 1):]
+
+def os_label():
+    if IS_LINUX:
+        return "Linux"
+    if IS_MACOS:
+        return "macOS"
+    if IS_WINDOWS:
+        return "Windows"
+    return HOST_OS
+
+def shell_label():
+    if IS_WINDOWS:
+        return "cmd.exe"
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    return os.path.basename(shell) or "sh"
 
 def center_print(text, width=None):
     w   = width or tw()
@@ -98,7 +127,7 @@ def clean_content(text):
 
 def clean_path(path):
     path = path.strip(" \t\r\n\"'`")
-    # Remove some extremely invalid chars for windows paths if accidentally generated
+    # Remove characters that commonly leak from generated placeholder paths.
     return re.sub(r'[*?<>|]', '', path)
 
 def is_dummy_path(p):
@@ -153,10 +182,10 @@ def print_logo():
 
 # ─── Panel (OpenCode-style: left blue accent bar, subtle bg) ──────────────────
 def _pw():
-    return min(tw() - 8, 68)
+    return min(76, max(20, tw() - 6))
 
 def _pp():
-    return (tw() - _pw()) // 2
+    return max(0, (tw() - _pw()) // 2)
 
 def _panel_row(content='', use_accent=True, accent_col=None):
     col = accent_col or C_ACCENT
@@ -165,7 +194,7 @@ def _panel_row(content='', use_accent=True, accent_col=None):
     acc = (' ' + col + '▍' + RESET) if use_accent else '  '
     vis = vis_len(content)
     pad = ' ' * max(0, pw - vis - 1)
-    print(sp + BG_PANEL + acc + BG_PANEL + content + pad + RESET)
+    print(sp + BG_PANEL + acc + BG_PANEL + content + BG_PANEL + pad + RESET)
 
 def _panel_sep():
     pw = _pw()
@@ -189,31 +218,56 @@ def _hints_line():
     pp = _pp()
     h  = (f'{DIM}{C_GRAY}tab{RESET} {C_GRAY}help'
           f'   {DIM}{C_GRAY}new{RESET} {C_GRAY}chat'
+          f'   {DIM}{C_GRAY}model{RESET} {C_GRAY}switch'
           f'   {DIM}{C_GRAY}exit{RESET} {C_GRAY}quit{RESET}')
     hv  = vis_len(h)
     # right-align to match panel right edge
     pad = pp + pw + 2 - hv
     print(' ' * max(0, pad) + h)
 
+def _panel_kv(label, value, value_color=C_WHITE):
+    content = (f' {DIM}{C_GRAY}{label:<8}{RESET}{BG_PANEL} '
+               f'{value_color}{value}{RESET}{BG_PANEL}')
+    _panel_row(content, use_accent=True, accent_col=C_DIM_C)
+
 # ─── Status bar ───────────────────────────────────────────────────────────────
 def print_status_bar(model_name, api_ok, msg_count=0):
-    W    = tw()
-    cwd  = os.getcwd().replace(str(Path.home()), '~')
     dot  = (C_GREEN if api_ok else C_RED) + '●' + RESET
-    mdl  = DIM + C_GRAY + model_name + RESET
-    msgs = (DIM + C_GRAY + f'  {msg_count} msg{"s" if msg_count != 1 else ""}' + RESET) if msg_count else ''
-    left  = BG_STATUS + f'  {DIM}{C_GRAY}{cwd}{RESET}{BG_STATUS}  {dot}  {mdl}{msgs} '
-    right = BG_STATUS + f' {DIM}{C_GRAY}{VERSION}{RESET}{BG_STATUS}  '
-    gap   = W - vis_len(left) - vis_len(right)
-    print(left + ' ' * max(0, gap) + right + RESET)
+    msg_label = f'{msg_count} msg{"s" if msg_count != 1 else ""}' if msg_count else 'ready'
+    meta = f'{os_label()}:{shell_label()}  {VERSION}'
+    reserved = len(msg_label) + len(meta) + 20
+    cwd = ellipsize(os.getcwd().replace(str(Path.home()), '~'), max(12, _pw() - reserved))
+    mdl = ellipsize(model_name, max(12, _pw() - reserved - vis_len(cwd)))
+    content = (
+        f' {dot}  {DIM}{C_GRAY}{cwd}{RESET}{BG_PANEL}'
+        f'  {C_ACCENT}{mdl}{RESET}{BG_PANEL}'
+        f'  {DIM}{C_GRAY}{msg_label}{RESET}{BG_PANEL}'
+        f'  {DIM}{C_GRAY}{meta}{RESET}{BG_PANEL}'
+    )
+    _panel_row(content, use_accent=True, accent_col=C_DIM_C)
 
 # ─── Home screen ──────────────────────────────────────────────────────────────
+def _home_panel(model_name, api_ok):
+    cwd = ellipsize(os.getcwd().replace(str(Path.home()), '~'), max(18, _pw() - 16))
+    api = 'online' if api_ok else 'offline'
+    api_col = C_GREEN if api_ok else C_RED
+    header = (f' {BOLD}{C_WHITE}OPENMODEL{RESET}{BG_PANEL}  '
+              f'{DIM}{C_GRAY}terminal AI workspace{RESET}{BG_PANEL}')
+    _panel_blank(dim=True)
+    _panel_row(header, use_accent=True, accent_col=C_TEAL)
+    _panel_sep()
+    _panel_kv('model', ellipsize(model_name, max(12, _pw() - 16)), C_ACCENT)
+    _panel_kv('shell', f'{os_label()} / {shell_label()}', C_TEAL)
+    _panel_kv('api', f'● {api}', api_col)
+    _panel_kv('cwd', cwd, C_GRAY)
+    _panel_blank(dim=True)
+
 def render_home(model_name, api_ok):
     clear_screen()
     print_logo()
-    _hints_line()
+    _home_panel(model_name, api_ok)
     print()
-    print_status_bar(model_name, api_ok)
+    _hints_line()
     print()
 
 # ─── Windows raw input (handles wrap manually via msvcrt) ─────────────────────
@@ -332,97 +386,29 @@ def _windows_raw_input(start_col, panel_right_col, pp):
     return ''.join(chars)
 
 
-# ─── Interactive input panel ──────────────────────────────────────────────────
-def read_input(model_name):
-    pw = _pw()
-    pp = _pp()
-    sp = ' ' * pp
+# ─── Conversation input ───────────────────────────────────────────────────────
+def read_input(nickname='You'):
+    now = datetime.now().strftime('%H:%M')
+    print()
+    _msg_header(nickname, C_ACCENT, now)
+    print()
 
-    # Panel top rows
-    _panel_blank(dim=True)
-    _panel_sep()
-
-    # Visual prefix: pp spaces + ' ' + '▍' + '  '  →  pp+4 printable chars.
-    # This is the column index (0-based) where typing actually starts.
-    PROMPT_VIS = pp + 4
-
-    if _HAS_PT:
-        # ── prompt_toolkit path (any OS) ──────────────────────────────────────
-        # prompt_toolkit draws the prompt itself and handles continuation indent.
-        pt_prompt_str = (BG_PANEL + sp + ' ' + C_ACCENT + '▍'
-                         + RESET + BG_PANEL + C_WHITE + '  ')
-
-        sys.stdout.flush()
-        try:
+    prompt_str = f'    {C_WHITE}'
+    sys.stdout.flush()
+    try:
+        if _HAS_PT:
             user_input = _pt_prompt(
-                _PT_ANSI(pt_prompt_str),
-                prompt_continuation=' ' * PROMPT_VIS,
+                _PT_ANSI(prompt_str),
+                prompt_continuation='    ',
                 multiline=False,
             )
-        except (EOFError, KeyboardInterrupt):
-            user_input = ''
-        sys.stdout.write(RESET)
+        else:
+            user_input = input(prompt_str)
+    except (EOFError, KeyboardInterrupt):
+        user_input = ''
 
-        sys.stdout.write('\033[1A\033[2K\r')
-        _panel_blank(dim=True)
-        _panel_sep()
-        _model_row(model_name)
-        _panel_blank(dim=True)
-
-    elif platform.system() == 'Windows':
-        # ── Windows raw-input path ────────────────────────────────────────────
-        # Pre-draw the full panel including footer rows, then move cursor back
-        # to the typing column. _windows_raw_input uses \033[L (insert line)
-        # on wrap to push footer rows down without overwriting them.
-        fill = max(0, pw - 4)
-        active_full = (sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET
-                       + BG_PANEL + C_WHITE + '  ' + ' ' * fill + RESET)
-        sys.stdout.write(active_full + '\n')
-        _panel_sep()
-        _model_row(model_name)
-        _panel_blank(dim=True)
-        sys.stdout.write('\033[4A')                  # up 4 → back to input row
-        sys.stdout.write(f'\033[{PROMPT_VIS + 1}G')  # absolute col (1-indexed)
-        sys.stdout.write(BG_PANEL + C_WHITE)
-        sys.stdout.flush()
-
-        panel_right_col = pp + pw
-        user_input = _windows_raw_input(PROMPT_VIS, panel_right_col, pp)
-        # Cursor is now below the footer — no extra drawing needed.
-
-    else:
-        # ── Unix/macOS readline path ──────────────────────────────────────────
-        # \001 / \002 bracket non-printing escape sequences so that readline
-        # counts the correct visible prompt width (PROMPT_VIS chars) and wraps
-        # input at the real terminal edge.
-        fill = max(0, pw - 4)
-        active_full = (sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET
-                       + BG_PANEL + C_WHITE + '  ' + ' ' * fill + RESET)
-        sys.stdout.write(active_full)
-        sys.stdout.write('\n')
-        _panel_sep()
-        _model_row(model_name)
-        _panel_blank(dim=True)
-        sys.stdout.write('\033[4A\r')
-        sys.stdout.flush()
-
-        def _rl(s): return f'\001{s}\002'
-        rl_prompt = (
-            _rl(BG_PANEL) + sp + ' '
-            + _rl(C_ACCENT) + '▍'
-            + _rl(RESET + BG_PANEL + C_WHITE) + '  '
-        )
-        user_input = input(rl_prompt)
-        sys.stdout.write(RESET)
-
-        sys.stdout.write('\033[1A\033[2K\r')
-        _panel_blank(dim=True)
-        sys.stdout.write('\033[3B\r')
-
+    sys.stdout.write(RESET)
     print()
-    _hints_line()
-    print()
-
     return user_input.strip()
 
 # ─── Spinner ──────────────────────────────────────────────────────────────────
@@ -475,8 +461,9 @@ class Spinner:
             time.sleep(0.08)
             i += 1
 
-    def start(self):
-        self._start_time = time.time()
+    def start(self, reset_timer=True):
+        if reset_timer:
+            self._start_time = time.time()
         self._stop.clear()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
@@ -487,6 +474,9 @@ class Spinner:
             self._thread.join()
         sys.stdout.write('\r' + ' ' * tw() + '\r')
         sys.stdout.flush()
+
+class RequestCancelled(Exception):
+    pass
 
 # ─── Message display ──────────────────────────────────────────────────────────
 def _msg_header(label, color, ts=None):
@@ -609,17 +599,116 @@ def print_ai_response(text):
         flush_code()
 
 # ─── Streaming printer ────────────────────────────────────────────────────────
-def print_ai_stream(generator, mdl):
+def confirm_cancel_request():
+    try:
+        ans = input(f'\n  {C_YELLOW}Точно отменить запрос? (Y/n):{RESET}  ').strip().lower()
+    except KeyboardInterrupt:
+        print()
+        return True
+    return ans not in ('n', 'no', 'н', 'нет')
+
+def print_ai_stream(generator, mdl, control=None):
     spinner = Spinner('Thinking')
-    spinner.start()
     full = ''
     start_time = time.time()
+    token_queue = queue.Queue()
+    done = object()
+    cancel_event = threading.Event()
+    sigint_event = threading.Event()
+    old_sigint = None
+    sigint_installed = False
 
-    for token in generator:
-        full += token
-        spinner.update_text(full)
+    def sigint_handler(_signum, _frame):
+        sigint_event.set()
 
-    spinner.stop()
+    def install_sigint_handler():
+        nonlocal old_sigint, sigint_installed
+        if threading.current_thread() is not threading.main_thread() or sigint_installed:
+            return
+        old_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, sigint_handler)
+        sigint_installed = True
+
+    def restore_sigint_handler():
+        nonlocal sigint_installed
+        if threading.current_thread() is threading.main_thread() and sigint_installed:
+            signal.signal(signal.SIGINT, old_sigint)
+            sigint_installed = False
+
+    def close_active_response():
+        if control is not None:
+            control['cancelled'] = True
+            resp = control.get('response')
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+    def stream_worker():
+        try:
+            for token in generator:
+                if cancel_event.is_set():
+                    break
+                token_queue.put(('token', token))
+        except BaseException as e:
+            if not cancel_event.is_set():
+                token_queue.put(('error', e))
+        finally:
+            token_queue.put((done, None))
+
+    def handle_cancel_prompt():
+        spinner.stop()
+        restore_sigint_handler()
+        try:
+            should_cancel = confirm_cancel_request()
+        finally:
+            install_sigint_handler()
+
+        if should_cancel:
+            cancel_event.set()
+            close_active_response()
+            worker.join(timeout=1)
+            print(f'\n  {DIM}{C_GRAY}[Cancelled]{RESET}\n')
+            raise RequestCancelled()
+
+        sigint_event.clear()
+        print(f'  {DIM}{C_GRAY}Continuing request...{RESET}')
+        spinner.start(reset_timer=False)
+
+    worker = threading.Thread(target=stream_worker, daemon=True)
+    worker.start()
+    install_sigint_handler()
+    spinner.start()
+
+    try:
+        while True:
+            try:
+                while True:
+                    if sigint_event.is_set():
+                        raise KeyboardInterrupt()
+                    try:
+                        kind, value = token_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if sigint_event.is_set():
+                        raise KeyboardInterrupt()
+
+                    if kind is done:
+                        break
+                    if kind == 'error':
+                        raise value
+
+                    full += value
+                    spinner.update_text(full)
+                break
+            except KeyboardInterrupt:
+                handle_cancel_prompt()
+                continue
+    finally:
+        restore_sigint_handler()
+        spinner.stop()
+
     elapsed = int(time.time() - start_time)
 
     if full.strip():
@@ -757,24 +846,48 @@ def check_api():
 API_AVAILABLE = check_api()
 
 # ─── OpenRouter streaming ─────────────────────────────────────────────────────
-DEFAULT_SYS = (
-    "You are a helpful AI assistant with full access to the user's computer. "
-    "To create a new file, use EXACTLY this format:\n"
-    "[NEW_FILE: path/to/file]\n...file content...\n[/NEW_FILE]\n"
-    "To modify an existing file, use EXACTLY this format:\n"
-    "[EDIT_FILE: path/to/file]\n...full new content...\n[/EDIT_FILE]\n"
-    "Directories are created automatically, do NOT use [CMD] mkdir.\n"
-    "Do NOT wrap file content in markdown code blocks. NO ```python, NO ```!\n"
-    "Write the RAW file content directly inside the tags.\n"
-    "Apply changes directly using [EDIT_FILE]. Do NOT create temporary files.\n"
-    "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
-    "You will receive the command output in the next message. Reading commands (type, dir) execute silently in the background.\n"
-    "Note: The shell is Windows CMD. Do NOT use `cat`, use `type`. "
-    "Use %DESKTOP% for the Desktop path. "
-    "Format other responses with markdown. Always confirm before destructive actions."
-)
+def shell_guidance():
+    if IS_WINDOWS:
+        return (
+            "The command shell is Windows CMD. Use `dir` and `type` for reading files. "
+            "Use `%DESKTOP%` for the Desktop path. Quote paths with spaces."
+        )
+    return (
+        "The command shell is Linux/POSIX. Prefer `ls`, `cat`, `sed -n`, `grep`/`rg`, "
+        "`python3`, and `python3 -m pip`. Use `~/Desktop`, `$DESKTOP`, or absolute "
+        "paths for Desktop. Quote paths with spaces. Do not use Windows CMD syntax."
+    )
 
-def stream_openrouter(messages, extra_system=None):
+def default_system_prompt():
+    return (
+        "You are a helpful AI assistant with full access to the user's computer. "
+        "To create a new file, use EXACTLY this format:\n"
+        "[NEW_FILE: path/to/file]\n...file content...\n[/NEW_FILE]\n"
+        "To modify an existing file, use EXACTLY this format:\n"
+        "[EDIT_FILE: path/to/file]\n...full new content...\n[/EDIT_FILE]\n"
+        "Directories are created automatically, do NOT use [CMD] mkdir.\n"
+        "Do NOT wrap file content in markdown code blocks. NO ```python, NO ```!\n"
+        "Write the RAW file content directly inside the tags.\n"
+        "Apply changes directly using [EDIT_FILE]. Do NOT create temporary files.\n"
+        "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
+        "You will receive the command output in the next message. "
+        "Read-only inspection commands may execute silently in the background.\n"
+        f"{shell_guidance()} "
+        "Format other responses with markdown. Always confirm before destructive actions."
+    )
+
+DEFAULT_SYS = default_system_prompt()
+
+def runtime_system_context():
+    return (
+        f"CURRENT DIRECTORY: {os.getcwd()}\n"
+        f"OPERATING SYSTEM: {os_label()}\n"
+        f"SHELL: {shell_label()}\n"
+        f"DESKTOP DIRECTORY: {get_desktop()}\n"
+        f"COMMAND GUIDANCE: {shell_guidance()}"
+    )
+
+def stream_openrouter(messages, extra_system=None, control=None):
     if not API_AVAILABLE:
         yield '[API UNAVAILABLE] Cannot reach openrouter.ai'
         return
@@ -782,7 +895,7 @@ def stream_openrouter(messages, extra_system=None):
                'Content-Type': 'application/json',
                'HTTP-Referer': 'https://openrouter.ai'}
     sys_msg = extra_system or system_prompt or DEFAULT_SYS
-    sys_msg += f"\n\nCURRENT DIRECTORY: {os.getcwd()}"
+    sys_msg += f"\n\n{runtime_system_context()}"
     payload = {'model': model_name,
                'messages': [{'role': 'system', 'content': sys_msg}] + messages,
                'stream': True,
@@ -791,11 +904,15 @@ def stream_openrouter(messages, extra_system=None):
         in_reasoning = False
         with requests.post('https://openrouter.ai/api/v1/chat/completions',
                            headers=headers, json=payload, stream=True, timeout=60) as resp:
+            if control is not None:
+                control['response'] = resp
             resp.encoding = 'utf-8'
             if resp.status_code != 200:
                 yield f'[API ERROR] HTTP {resp.status_code}: {resp.text[:300]}'
                 return
             for line in resp.iter_lines(decode_unicode=True):
+                if control is not None and control.get('cancelled'):
+                    return
                 if not line or line.startswith(':'):
                     continue
                 if line.startswith('data: '):
@@ -825,11 +942,16 @@ def stream_openrouter(messages, extra_system=None):
         if in_reasoning:
             yield '\n</think>\n'
     except Exception as e:
+        if control is not None and control.get('cancelled'):
+            return
         yield f'[API ERROR] {e}'
+    finally:
+        if control is not None:
+            control.pop('response', None)
 
 # ─── System command helpers ───────────────────────────────────────────────────
 def get_desktop():
-    if platform.system() == 'Windows':
+    if IS_WINDOWS:
         try:
             import winreg
             k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -844,30 +966,61 @@ def get_desktop():
             if p.exists():
                 return str(p)
         return os.path.expandvars(r'%USERPROFILE%\Desktop')
+    xdg_cfg = Path.home() / '.config' / 'user-dirs.dirs'
+    try:
+        if xdg_cfg.exists():
+            for line in xdg_cfg.read_text(encoding='utf-8', errors='replace').splitlines():
+                if line.startswith('XDG_DESKTOP_DIR='):
+                    value = line.split('=', 1)[1].strip().strip('"')
+                    value = value.replace('$HOME', str(Path.home()))
+                    desktop = os.path.expandvars(os.path.expanduser(value))
+                    if desktop:
+                        return desktop
+    except Exception:
+        pass
     return str(Path.home() / 'Desktop')
 
+def expand_desktop_token(text):
+    desktop = get_desktop()
+    text = str(text).replace('%DESKTOP%', desktop)
+    return re.sub(r'\$\{DESKTOP\}|\$DESKTOP\b', lambda _m: desktop, text)
+
+def expand_special_path(path):
+    path = expand_desktop_token(path).strip().strip('"\'')
+    return os.path.expandvars(os.path.expanduser(path))
+
+def command_env():
+    env = os.environ.copy()
+    env['DESKTOP'] = get_desktop()
+    env.setdefault('PYTHONUTF8', '1')
+    return env
+
 def execute_command(cmd):
-    cmd = cmd.replace('%DESKTOP%', get_desktop())
+    cmd = expand_desktop_token(cmd)
     if cmd.lower().strip().startswith('cd '):
-        target = os.path.expanduser(os.path.expandvars(cmd.strip()[3:].strip()))
+        target = expand_special_path(cmd.strip()[3:].strip())
         try:
             os.chdir(target)
             return f"[Directory changed to {os.getcwd()}]"
         except Exception as e:
             return f"[ERROR] {e}"
     try:
-        if platform.system() == 'Windows':
+        if IS_WINDOWS:
             # chcp 65001 ensures Cyrillic paths and output work correctly
             full_cmd = f'chcp 65001 >nul 2>&1 & {cmd}'
             r = subprocess.run(
                 ['cmd.exe', '/c', full_cmd],
                 capture_output=True, text=True,
                 timeout=30, encoding='utf-8', errors='replace',
-                env={**os.environ.copy(), 'PYTHONUTF8': '1'}
+                env=command_env()
             )
         else:
+            shell_exe = os.environ.get('SHELL')
+            if shell_exe and not os.path.exists(shell_exe):
+                shell_exe = None
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                               timeout=30, encoding='utf-8', errors='replace')
+                               timeout=30, encoding='utf-8', errors='replace',
+                               env=command_env(), executable=shell_exe)
         out = r.stdout.strip()
         err = r.stderr.strip()
         return (out + ('\n' + err if err else '')) or '[Command executed successfully]'
@@ -887,6 +1040,43 @@ def confirm_exec(cmd):
     return ans in ('y', 'yes', '1')
 
 # ─── File helpers ─────────────────────────────────────────────────────────────
+READ_ONLY_COMMANDS = {
+    'cat', 'cd', 'dir', 'file', 'find', 'grep', 'head', 'ls', 'pwd', 'realpath',
+    'rg', 'sed', 'stat', 'tail', 'tree', 'type', 'wc', 'where', 'which',
+}
+
+READ_ONLY_PREFIXES = (
+    'git status', 'git diff', 'git log', 'git show', 'git branch --show-current',
+    'python -m py_compile ', 'python3 -m py_compile ',
+)
+
+def command_verb(cmd):
+    try:
+        parts = shlex.split(cmd, posix=not IS_WINDOWS)
+        return parts[0].lower() if parts else ''
+    except Exception:
+        return cmd.strip().split(maxsplit=1)[0].lower() if cmd.strip() else ''
+
+def is_read_only_command(cmd):
+    low = cmd.strip().lower()
+    if not low:
+        return True
+    if any(low.startswith(prefix) for prefix in READ_ONLY_PREFIXES):
+        return True
+    if re.search(r'(^|[;&|]\s*)(sudo|rm|mv|cp|chmod|chown|truncate|tee|dd|mkfs|mount|umount|apt|apt-get|dnf|pacman|zypper|pip|pip3|npm|pnpm|yarn|git)\b', low):
+        return False
+    if '>' in low or re.search(r'\b-delete\b|\b-exec\b', low):
+        return False
+    if re.search(r'\bsed\b.*\s-i(\s|$)', low):
+        return False
+    return command_verb(low) in READ_ONLY_COMMANDS
+
+def resolve_path(path, base_dir=None):
+    path = clean_path(expand_special_path(path))
+    if os.path.isabs(path):
+        return path
+    return os.path.join(base_dir or os.getcwd(), path)
+
 def detect_read(text):
     for p in [
         r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+['\"](.+?)['\"](?:\s+(?:и\s+)?(.+?))?$",
@@ -988,7 +1178,7 @@ def main():
 
     while True:
         try:
-            user_input = read_input(model_name)
+            user_input = read_input(nickname)
         except (EOFError, KeyboardInterrupt):
             print(f'\n\n  {DIM}{C_GRAY}Goodbye.{RESET}\n')
             break
@@ -1046,8 +1236,7 @@ def main():
             continue
 
         if lower.startswith('cd '):
-            new_dir = user_input[3:].strip()
-            new_dir = os.path.expandvars(os.path.expanduser(new_dir))
+            new_dir = expand_special_path(user_input[3:].strip())
             try:
                 os.chdir(new_dir)
                 print(f'\n  {C_GREEN}✓{RESET}  Changed directory to: {C_ACCENT}{os.getcwd()}{RESET}\n')
@@ -1059,12 +1248,10 @@ def main():
         proj_path = detect_create_project(user_input)
         if proj_path:
             # Resolve path (handles spaces, Cyrillic, relative paths)
-            proj_path = os.path.expandvars(os.path.expanduser(proj_path.strip()))
+            proj_path = resolve_path(proj_path.strip())
             if not os.path.exists(proj_path):
                 print(f'\n  {C_RED}✗  File not found: {proj_path}{RESET}\n')
                 continue
-
-            print_user_msg(user_input, nickname)
 
             # ── Read file SILENTLY via Python (no CMD, no confirmation) ────────
             try:
@@ -1086,6 +1273,7 @@ def main():
                 "Do NOT wrap the file content in markdown code blocks. Use RAW text only!\n"
                 "For every shell command to run (install deps, init git, etc.), use [CMD]command[/CMD]. "
                 "In [CMD] blocks, use paths relative to the project directory or absolute paths. "
+                f"Commands run on {os_label()} using {shell_label()}. {shell_guidance()} "
                 "Do NOT ask clarifying questions — implement everything described. "
                 "Use markdown in explanations only, not inside file content tags."
             )
@@ -1096,21 +1284,23 @@ def main():
             )
 
             try:
+                control = {}
                 full = print_ai_stream(
                     stream_openrouter(
                         [{'role': 'user', 'content': build_prompt}],
-                        extra_system=project_sys
+                        extra_system=project_sys,
+                        control=control
                     ),
-                    model_name
+                    model_name,
+                    control
                 )
 
                 # ── Auto-create files (no confirmation needed) ─────────────
                 for rel_path, content in re.findall(
                         r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|CMD))|\Z)', full, re.DOTALL):
-                    rel_path = clean_path(rel_path.replace('%DESKTOP%', get_desktop()))
+                    rel_path = clean_path(expand_special_path(rel_path))
                     if is_dummy_path(rel_path): continue
-                    abs_path = (rel_path if os.path.isabs(rel_path)
-                                else os.path.join(project_dir, rel_path))
+                    abs_path = resolve_path(rel_path, project_dir)
                     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
                     open(abs_path, 'w', encoding='utf-8').write(clean_content(content) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{abs_path}{RESET}\n')
@@ -1133,6 +1323,8 @@ def main():
                 chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
                                (user_input, full))
                 chat_conn.commit()
+            except RequestCancelled:
+                pass
             except Exception as e:
                 print(f'\n  {C_RED}Error: {e}{RESET}\n')
             continue
@@ -1140,22 +1332,26 @@ def main():
         # ── File read ──────────────────────────────────────────────────────────
         fp, inst = detect_read(user_input)
         if fp:
+            fp = resolve_path(fp)
             if not os.path.exists(fp):
                 print(f'\n  {C_RED}✗  File not found: {fp}{RESET}\n')
                 continue
-            print_user_msg(user_input, nickname)
             try:
                 content = open(fp, encoding='utf-8', errors='replace').read()
                 task    = inst or 'Summarize this file and explain what it does.'
                 sys_m   = ('You are a code analysis assistant. '
                            'Use clear markdown formatting. No [CMD] tags.')
                 prompt  = f'FILE PATH: {fp}\n\nCONTENT:\n```\n{content}\n```\n\nTASK: {task}'
+                control = {}
                 full    = print_ai_stream(
-                    stream_openrouter([{'role': 'user', 'content': prompt}], extra_system=sys_m),
-                    model_name)
+                    stream_openrouter([{'role': 'user', 'content': prompt}],
+                                      extra_system=sys_m, control=control),
+                    model_name, control)
                 chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
                                (user_input, full))
                 chat_conn.commit()
+            except RequestCancelled:
+                pass
             except Exception as e:
                 print(f'\n  {C_RED}Error: {e}{RESET}\n')
             continue
@@ -1163,10 +1359,10 @@ def main():
         # ── File modify ────────────────────────────────────────────────────────
         mfp, mtask = detect_modify(user_input)
         if mfp and mtask:
+            mfp = resolve_path(mfp)
             if not os.path.exists(mfp):
                 print(f'\n  {C_RED}✗  File not found: {mfp}{RESET}\n')
                 continue
-            print_user_msg(user_input, nickname)
             try:
                 orig   = open(mfp, encoding='utf-8', errors='replace').read()
                 prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
@@ -1175,8 +1371,10 @@ def main():
                           'New file → [NEW_FILE: path]...[/NEW_FILE] (Directories are created automatically)\n'
                           'Do NOT wrap code inside tags with ``` blocks. Use RAW text.\n'
                           'Shell cmd → [CMD]cmd[/CMD]')
+                control = {}
                 full = print_ai_stream(
-                    stream_openrouter([{'role': 'user', 'content': prompt}]), model_name)
+                    stream_openrouter([{'role': 'user', 'content': prompt}], control=control),
+                    model_name, control)
                 
                 m_old = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
                 if m_old:
@@ -1184,19 +1382,17 @@ def main():
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{mfp}{RESET}\n')
                 
                 for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                    efp = clean_path(efp.replace('%DESKTOP%', get_desktop()))
+                    efp = clean_path(expand_special_path(efp))
                     if is_dummy_path(efp): continue
-                    if not os.path.isabs(efp):
-                        efp = os.path.join(os.path.dirname(os.path.abspath(mfp)), efp)
+                    efp = resolve_path(efp, os.path.dirname(os.path.abspath(mfp)))
                     os.makedirs(os.path.dirname(efp), exist_ok=True)
                     open(efp, 'w', encoding='utf-8').write(clean_content(ec) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
 
                 for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                    nfp = clean_path(nfp.replace('%DESKTOP%', get_desktop()))
+                    nfp = clean_path(expand_special_path(nfp))
                     if is_dummy_path(nfp): continue
-                    if not os.path.isabs(nfp):
-                        nfp = os.path.join(os.path.dirname(os.path.abspath(mfp)), nfp)
+                    nfp = resolve_path(nfp, os.path.dirname(os.path.abspath(mfp)))
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
                     open(nfp, 'w', encoding='utf-8').write(clean_content(nc) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
@@ -1208,12 +1404,13 @@ def main():
                 chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
                                (user_input, full))
                 chat_conn.commit()
+            except RequestCancelled:
+                pass
             except Exception as e:
                 print(f'\n  {C_RED}Error: {e}{RESET}\n')
             continue
 
         # ── Normal multi-turn chat ─────────────────────────────────────────────
-        print_user_msg(user_input, nickname)
         conversation.append({'role': 'user', 'content': user_input})
         msg_count += 1
 
@@ -1222,7 +1419,16 @@ def main():
             agent_loop_count += 1
             full = ''
             try:
-                full = print_ai_stream(stream_openrouter(conversation), model_name)
+                control = {}
+                full = print_ai_stream(
+                    stream_openrouter(conversation, control=control),
+                    model_name,
+                    control
+                )
+            except RequestCancelled:
+                conversation.pop()
+                msg_count -= 1
+                break
             except KeyboardInterrupt:
                 print(f'\n  {C_GRAY}[Cancelled]{RESET}\n')
                 conversation.pop()
@@ -1233,10 +1439,9 @@ def main():
                 conversation.append({'role': 'assistant', 'content': full})
 
             for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                nfp = clean_path(nfp.replace('%DESKTOP%', get_desktop()))
+                nfp = clean_path(expand_special_path(nfp))
                 if is_dummy_path(nfp): continue
-                if not os.path.isabs(nfp):
-                    nfp = os.path.join(os.getcwd(), nfp)
+                nfp = resolve_path(nfp)
                 try:
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
                     open(nfp, 'w', encoding='utf-8').write(clean_content(nc) + '\n')
@@ -1245,10 +1450,9 @@ def main():
                     print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
 
             for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                efp = clean_path(efp.replace('%DESKTOP%', get_desktop()))
+                efp = clean_path(expand_special_path(efp))
                 if is_dummy_path(efp): continue
-                if not os.path.isabs(efp):
-                    efp = os.path.join(os.getcwd(), efp)
+                efp = resolve_path(efp)
                 try:
                     os.makedirs(os.path.dirname(efp), exist_ok=True)
                     open(efp, 'w', encoding='utf-8').write(clean_content(ec) + '\n')
@@ -1268,7 +1472,7 @@ def main():
                 cmd = cmd.strip()
                 if not cmd: continue
                 # Silent execution for safe reading commands
-                if cmd.lower().startswith(('type ', 'cat ', 'dir ', 'ls ', 'cd ')):
+                if is_read_only_command(cmd):
                     out = execute_command(cmd)
                     cmd_results.append(f"Result of `{cmd}`:\n```\n{out}\n```")
                 else:
@@ -1284,9 +1488,6 @@ def main():
                 conversation.append({'role': 'user', 'content': msg})
                 msg_count += 1
                 continue
-
-        print_status_bar(model_name, API_AVAILABLE, msg_count)
-        print()
 
     conn.close()
     chat_conn.close()
