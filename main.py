@@ -17,18 +17,13 @@ except ImportError:
 
 # ─── Windows UTF-8 + VT100 ANSI fix ─────────────────────────────────────────
 if IS_WINDOWS:
-    # Step 1: Enable VT processing FIRST, before any stdout wrapping.
-    # ENABLE_PROCESSED_OUTPUT            = 0x0001
-    # ENABLE_WRAP_AT_EOL_OUTPUT          = 0x0002
-    # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
     _VT_FLAGS = 0x0001 | 0x0002 | 0x0004
-    _INVALID_HANDLE = -1  # INVALID_HANDLE_VALUE as signed int
+    _INVALID_HANDLE = -1
     try:
         import ctypes
         _kernel32 = ctypes.windll.kernel32
-        for _hid in (-10, -11, -12):   # stdin, stdout, stderr handles
+        for _hid in (-10, -11, -12):
             _h = _kernel32.GetStdHandle(_hid)
-            # Skip invalid handles (may happen when launched via shortcut/UAC)
             if _h == 0 or ctypes.c_long(_h).value == _INVALID_HANDLE:
                 continue
             _m = ctypes.c_ulong(0)
@@ -37,10 +32,8 @@ if IS_WINDOWS:
     except Exception:
         pass
 
-    # Step 2: Flush before wrapping so no buffered bytes are lost.
     sys.stdout.flush()
     sys.stderr.flush()
-    # Step 3: Wrap stdout/stderr for UTF-8 AFTER VT is enabled.
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -69,7 +62,7 @@ BG_PANEL  = bg_rgb(20, 22, 26)
 BG_STATUS = bg_rgb(13, 17, 23)
 BG_CODE   = bg_rgb(9,  25, 29)
 
-VERSION = "v2.2-linux"
+VERSION = "v2.3-multi-provider"
 
 # ─── Terminal helpers ──────────────────────────────────────────────────────────
 def tw():
@@ -113,8 +106,6 @@ def center_print(text, width=None):
     print(' ' * pad + text)
 
 def clear_screen():
-    # ANSI: erase entire screen + scrollback, then move cursor to top-left
-    # This works reliably in Windows Terminal, cmd, and Linux/macOS
     sys.stdout.write('\033[3J\033[2J\033[H')
     sys.stdout.flush()
 
@@ -127,14 +118,12 @@ def clean_content(text):
 
 def clean_path(path):
     path = path.strip(" \t\r\n\"'`")
-    # Remove characters that commonly leak from generated placeholder paths.
     return re.sub(r'[*?<>|]', '', path)
 
 def is_dummy_path(p):
     if not p: return True
     p = p.replace('\\', '/').strip().lower()
     return p in ('path/to/file', 'path/relative/to/project', 'path', 'path/to/cmd', 'to cmd', 'path/to/file.ext', 'filename.ext', 'path/to')
-
 
 # ─── Logo ─────────────────────────────────────────────────────────────────────
 LOGO_BIG = [
@@ -180,7 +169,7 @@ def print_logo():
         center_print(BOLD + C_ACCENT + 'OPENMODEL' + RESET)
     print()
 
-# ─── Panel (OpenCode-style: left blue accent bar, subtle bg) ──────────────────
+# ─── Panel ────────────────────────────────────────────────────────────────────
 def _pw():
     return min(76, max(20, tw() - 6))
 
@@ -206,14 +195,7 @@ def _panel_blank(dim=False):
     col = C_DIM_C if dim else C_ACCENT
     _panel_row(use_accent=True, accent_col=col)
 
-def _model_row(model_name):
-    content = (f' {DIM}{C_GRAY}agent{RESET}{BG_PANEL}   '
-               f'{C_ACCENT}{BOLD}{model_name}{RESET}{BG_PANEL}   '
-               f'{DIM}{C_GRAY}openmodel')
-    _panel_row(content, use_accent=False)
-
 def _hints_line():
-    W  = tw()
     pw = _pw()
     pp = _pp()
     h  = (f'{DIM}{C_GRAY}tab{RESET} {C_GRAY}help'
@@ -221,7 +203,6 @@ def _hints_line():
           f'   {DIM}{C_GRAY}model{RESET} {C_GRAY}switch'
           f'   {DIM}{C_GRAY}exit{RESET} {C_GRAY}quit{RESET}')
     hv  = vis_len(h)
-    # right-align to match panel right edge
     pad = pp + pw + 2 - hv
     print(' ' * max(0, pad) + h)
 
@@ -230,32 +211,18 @@ def _panel_kv(label, value, value_color=C_WHITE):
                f'{value_color}{value}{RESET}{BG_PANEL}')
     _panel_row(content, use_accent=True, accent_col=C_DIM_C)
 
-# ─── Status bar ───────────────────────────────────────────────────────────────
-def print_status_bar(model_name, api_ok, msg_count=0):
-    dot  = (C_GREEN if api_ok else C_RED) + '●' + RESET
-    msg_label = f'{msg_count} msg{"s" if msg_count != 1 else ""}' if msg_count else 'ready'
-    meta = f'{os_label()}:{shell_label()}  {VERSION}'
-    reserved = len(msg_label) + len(meta) + 20
-    cwd = ellipsize(os.getcwd().replace(str(Path.home()), '~'), max(12, _pw() - reserved))
-    mdl = ellipsize(model_name, max(12, _pw() - reserved - vis_len(cwd)))
-    content = (
-        f' {dot}  {DIM}{C_GRAY}{cwd}{RESET}{BG_PANEL}'
-        f'  {C_ACCENT}{mdl}{RESET}{BG_PANEL}'
-        f'  {DIM}{C_GRAY}{msg_label}{RESET}{BG_PANEL}'
-        f'  {DIM}{C_GRAY}{meta}{RESET}{BG_PANEL}'
-    )
-    _panel_row(content, use_accent=True, accent_col=C_DIM_C)
-
 # ─── Home screen ──────────────────────────────────────────────────────────────
 def _home_panel(model_name, api_ok):
     cwd = ellipsize(os.getcwd().replace(str(Path.home()), '~'), max(18, _pw() - 16))
     api = 'online' if api_ok else 'offline'
     api_col = C_GREEN if api_ok else C_RED
+    provider = "Google AI Studio" if is_google_key(api_key) else "OpenRouter"
     header = (f' {BOLD}{C_WHITE}OPENMODEL{RESET}{BG_PANEL}  '
               f'{DIM}{C_GRAY}terminal AI workspace{RESET}{BG_PANEL}')
     _panel_blank(dim=True)
     _panel_row(header, use_accent=True, accent_col=C_TEAL)
     _panel_sep()
+    _panel_kv('provider', provider, C_ACCENT2)
     _panel_kv('model', ellipsize(model_name, max(12, _pw() - 16)), C_ACCENT)
     _panel_kv('shell', f'{os_label()} / {shell_label()}', C_TEAL)
     _panel_kv('api', f'● {api}', api_col)
@@ -269,122 +236,6 @@ def render_home(model_name, api_ok):
     print()
     _hints_line()
     print()
-
-# ─── Windows raw input (handles wrap manually via msvcrt) ─────────────────────
-def _windows_raw_input(start_col, panel_right_col, pp):
-    """
-    Character-by-character input for Windows.
-
-    The full panel (including footer rows) is pre-drawn before this is called.
-    When text reaches panel_right_col we:
-      1. Move to next line  (\n)
-      2. Insert a blank line (\033[L) — pushes footer rows down by 1
-      3. Print continuation prefix (dim ▍ aligned with panel)
-    On Enter we skip past the footer with \033[3B so the caller can continue
-    drawing normally below it.
-
-    line_count tracks how many extra wrapped lines we've added so that
-    backspace past the start of a continuation line moves the cursor up.
-    """
-    import msvcrt
-    pw         = panel_right_col - pp   # panel width, derived from caller args
-    chars      = []
-    col        = start_col
-    line_count = 0          # number of wrapped continuation lines added
-
-    # Track how many chars belong to each line so we can navigate up correctly.
-    # line_lengths[0] = chars on the first (original) line,
-    # line_lengths[i] = chars on continuation line i.
-    # We only need to know when a line is "empty" to go back up.
-    chars_per_line = [0]    # chars on each visual line (index = line_count)
-
-    # Immediately set BG so the input row has the correct background colour
-    # even before the first keypress.
-    sys.stdout.write(BG_PANEL + C_WHITE)
-    sys.stdout.flush()
-
-    while True:
-        ch = msvcrt.getwch()
-
-        if ch == '\r':                          # Enter
-            # \n lands cursor on the pre-drawn sep row (footer row 1).
-            # \033[3B skips sep + model + blank → cursor below the panel.
-            # If we've added continuation lines the footer was already pushed
-            # down by line_count rows, so we only need 3B (the footer is always
-            # 3 rows below the *current* line after the last wrap).
-            sys.stdout.write('\n\033[3B\r')
-            sys.stdout.flush()
-            break
-
-        if ch == '\x03':                        # Ctrl-C
-            raise KeyboardInterrupt
-
-        if ch == '\x08':                        # Backspace
-            if chars:
-                chars.pop()
-                chars_per_line[line_count] -= 1
-
-                if col > start_col:
-                    # Normal backspace within current line
-                    sys.stdout.write('\b \b')
-                    col -= 1
-                elif line_count > 0:
-                    # At start of a continuation line — erase it and go up.
-                    line_count -= 1
-                    chars_per_line.pop()
-
-                    # 1) Erase the continuation line visually
-                    sys.stdout.write('\033[2K\r')
-                    # 2) Move cursor up one row (back to previous input line)
-                    sys.stdout.write('\033[1A')
-                    # 3) Now delete the empty line that's sitting below the cursor
-                    #    (\033[M deletes line at cursor, content below scrolls up),
-                    #    restoring the footer rows to their correct position.
-                    sys.stdout.write('\033[1B\033[M\033[1A')
-                    # 4) Position cursor at end of previous line's text
-                    prev_chars = chars_per_line[line_count]
-                    col = start_col + prev_chars
-                    sys.stdout.write(f'\033[{col + 1}G')  # 1-indexed absolute col
-                    sys.stdout.write(BG_PANEL + C_WHITE)
-                # else: at very start of first line, nothing to erase
-            sys.stdout.flush()
-            continue
-
-        if ch in ('\x00', '\xe0'):              # special / arrow keys — skip
-            msvcrt.getwch()
-            continue
-
-        # Ordinary printable character
-        chars.append(ch)
-        chars_per_line[line_count] += 1
-        sys.stdout.write(ch)
-        col += 1
-
-        # Wrap at panel right edge
-        if col >= panel_right_col:
-            line_count += 1
-            chars_per_line.append(0)
-            # Panel visible width = pw cols total:
-            #   ' '(1) + '▍'(1) + '  '(2) + fill(pw-4) = pw  ✓
-            # typing_width = pw - 4 matches the first input line fill.
-            typing_width = pw - 4
-            cont = (RESET
-                    + '\n\033[L'
-                    + ' ' * pp                          # outside panel — no BG
-                    + BG_PANEL + ' ' + C_DIM_C + '▍'   # left accent bar
-                    + BG_PANEL + '  '                   # 2-space indent
-                    + ' ' * typing_width                # fill panel interior with BG
-                    + RESET                             # stop BG at right edge
-                    + f'\033[{start_col + 1}G'          # jump cursor back to typing start
-                    + BG_PANEL + C_WHITE)               # restore colour for typing
-            sys.stdout.write(cont)
-            col = start_col
-
-        sys.stdout.flush()
-
-    sys.stdout.write(RESET)
-    return ''.join(chars)
-
 
 # ─── Conversation input ───────────────────────────────────────────────────────
 def read_input(nickname='You'):
@@ -485,21 +336,6 @@ def _msg_header(label, color, ts=None):
     hdr = f'  {color}{BOLD}{label}{RESET}{ts_str}'
     hv  = vis_len(hdr)
     print(hdr + '  ' + C_DIM_C + '─' * max(0, W - hv - 2) + RESET)
-
-def print_user_msg(text, nickname='You'):
-    now = datetime.now().strftime('%H:%M')
-    print()
-    _msg_header(nickname, C_ACCENT, now)
-    print()
-    W = tw()
-    width = min(W - 8, 96)
-    for line in text.split('\n'):
-        if not line.strip():
-            print()
-            continue
-        for row in textwrap.wrap(line, width) or ['']:
-            print(f'    {C_WHITE}{row}{RESET}')
-    print()
 
 def _ai_header(model_name_str):
     print()
@@ -738,12 +574,108 @@ conn.commit()
 c.execute('SELECT api_key, model, nickname, system_prompt FROM config WHERE id=1')
 row = c.fetchone()
 
+# ─── Google AI Studio helpers ─────────────────────────────────────────────────
+def is_google_key(k: str) -> bool:
+    if not k:
+        return False
+    k = k.strip()
+    # Поддерживаем новые ключи AQ., стандартные AIza и любые не-OpenRouter ключи
+    if k.startswith(('AQ.', 'AQ', 'AIza')):
+        return True
+    if not k.startswith('sk-or-') and len(k) >= 28:
+        return True
+    return False
+
+def model_sort_key(item: dict) -> tuple:
+    mid = item['id'].lower()
+    # Извлекаем версию (2.7, 2.6, 2.5, 2.0, 1.5 и т.д.)
+    ver_match = re.search(r'gemini-(\d+(?:\.\d+)?)', mid)
+    ver = float(ver_match.group(1)) if ver_match else 0.0
+    is_exp = 1 if ('exp' in mid or 'preview' in mid or 'thinking' in mid) else 0
+    is_flash = 1 if 'flash' in mid else 0
+    is_pro = 1 if 'pro' in mid else 0
+    return (ver, is_flash, is_pro, is_exp)
+
+def fetch_google_models(key: str) -> list[dict]:
+    """Получить ВСЕ доступные модели Google AI Studio, поддерживающие генерацию текста"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+    headers = {'x-goog-api-key': key}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            models = []
+            for m in data.get('models', []):
+                methods = m.get('supportedGenerationMethods', [])
+                name = m.get('name', '').replace('models/', '')
+                # Отбираем модели для диалогов/генерации контента
+                if 'generateContent' in methods and 'gemini' in name.lower():
+                    desc = m.get('description', '').split('.')[0]
+                    models.append({
+                        'id': name,
+                        'name': m.get('displayName', name),
+                        'desc': desc
+                    })
+            # Сортируем от самых новых версий к старым
+            models.sort(key=model_sort_key, reverse=True)
+            return models
+    except Exception:
+        pass
+    return []
+
+def select_google_model_interactive(key: str, default=None) -> str:
+    print(f'\n  {C_TEAL}⏳ Получаю список всех доступных моделей Google AI Studio...{RESET}')
+    models = fetch_google_models(key)
+    
+    if not models:
+        # Резервный список на случай сетевых сбоев
+        models = [
+            {'id': 'gemini-2.5-flash', 'name': 'Gemini 2.5 Flash', 'desc': 'Next-gen fast model'},
+            {'id': 'gemini-2.0-flash', 'name': 'Gemini 2.0 Flash', 'desc': 'Fast and powerful'},
+            {'id': 'gemini-2.0-flash-lite', 'name': 'Gemini 2.0 Flash-Lite', 'desc': 'Lightweight'},
+            {'id': 'gemini-1.5-flash', 'name': 'Gemini 1.5 Flash', 'desc': 'Fast, general purpose'},
+            {'id': 'gemini-1.5-pro', 'name': 'Gemini 1.5 Pro', 'desc': 'Complex reasoning'},
+        ]
+
+    print(f'\n  {BOLD}{C_ACCENT}Доступные модели Google AI Studio ({len(models)} шт.):{RESET}')
+    for idx, m in enumerate(models, 1):
+        num_str = f"[{idx}]"
+        desc_str = f" — {m['desc']}" if m['desc'] else ""
+        print(f'  {C_ACCENT2}{num_str:>5}{RESET}  {C_ACCENT}{m["id"]:<32}{RESET}{DIM}{C_GRAY}{desc_str}{RESET}')
+    print()
+
+    dflt_idx = 1
+    if default:
+        for i, m in enumerate(models, 1):
+            if m['id'].lower() == default.lower():
+                dflt_idx = i
+                break
+
+    while True:
+        sys.stdout.write(f'  {C_ACCENT}❯{RESET}  {C_WHITE}Введите номер модели или имя [{dflt_idx}]:{RESET}  ')
+        sys.stdout.flush()
+        choice = input().strip()
+        if not choice:
+            return models[dflt_idx - 1]['id']
+        if choice.isdigit():
+            val = int(choice)
+            if 1 <= val <= len(models):
+                return models[val - 1]['id']
+        # Если пользователь ввел точное имя модели (включая любую кастомную)
+        for m in models:
+            if choice.lower() == m['id'].lower():
+                return m['id']
+        # Разрешаем ввод любого кастомного идентификатора модели
+        if 'gemini' in choice.lower():
+            return choice
+        print(f'  {C_RED}✗ Неверный выбор. Введите число от 1 до {len(models)} или имя модели.{RESET}')
+
 # ─── Setup wizard ─────────────────────────────────────────────────────────────
 def setup_wizard():
     clear_screen()
     print('\n' * 3)
     center_print(C_ACCENT + BOLD + 'OPENMODEL  —  First-time setup' + RESET)
-    center_print(DIM + C_GRAY + 'Takes less than a minute' + RESET)
+    center_print(DIM + C_GRAY + 'Поддерживает OpenRouter и Google AI Studio' + RESET)
     print()
     print(C_DIM_C + '─' * tw() + RESET)
     print()
@@ -761,40 +693,44 @@ def setup_wizard():
         print(f'  {BOLD}{C_ACCENT}{label}{RESET}')
         print(f'  {C_DIM_C}{"─" * 44}{RESET}')
 
-    section('OPENROUTER API KEY')
-    print(f'  {DIM}{C_GRAY}Get yours at: https://openrouter.ai/keys{RESET}\n')
+    section('API KEY (GOOGLE AI STUDIO или OPENROUTER)')
+    print(f'  {DIM}{C_GRAY}• Google AI Studio (Free): https://aistudio.google.com/app/apikey{RESET}')
+    print(f'  {DIM}{C_GRAY}• OpenRouter:             https://openrouter.ai/keys{RESET}\n')
 
-    api_key = ask('Paste your API key')
+    api_key = ask('Вставьте ваш API ключ')
     while not api_key:
-        print(C_RED + '  ✗  API key cannot be empty.' + RESET)
-        api_key = ask('Paste your API key')
+        print(C_RED + '  ✗  Ключ не может быть пустым.' + RESET)
+        api_key = ask('Вставьте ваш API ключ')
 
-    # Show the key back to the user (as requested)
     preview = api_key[:8] + '·' * min(12, max(0, len(api_key) - 12)) + api_key[-4:]
-    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Key saved:{RESET}  {C_ACCENT}{preview}{RESET}')
+    provider_title = "Google AI Studio" if is_google_key(api_key) else "OpenRouter"
+    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Ключ сохранен ({provider_title}):{RESET}  {C_ACCENT}{preview}{RESET}')
 
-    section('MODEL')
-    examples = [
-        ('openai/gpt-4o-mini',                'fast & cheap (default)'),
-        ('anthropic/claude-3-haiku',           'smart & concise'),
-        ('deepseek/deepseek-r1',               'reasoning'),
-        ('meta-llama/llama-3.1-70b-instruct',  'open-source'),
-    ]
-    print()
-    for ex, note in examples:
-        print(f'  {C_DIM_C}·{RESET}  {C_ACCENT}{ex:<44}{RESET}{DIM}{C_GRAY}{note}{RESET}')
-    print()
-    model_name = ask('Model name', default='openai/gpt-4o-mini')
+    section('ВЫБОР МОДЕЛИ')
+    if is_google_key(api_key):
+        model_name = select_google_model_interactive(api_key)
+    else:
+        examples = [
+            ('openai/gpt-4o-mini',                'fast & cheap (default)'),
+            ('anthropic/claude-3-haiku',           'smart & concise'),
+            ('deepseek/deepseek-r1',               'reasoning'),
+            ('meta-llama/llama-3.1-70b-instruct',  'open-source'),
+        ]
+        print()
+        for ex, note in examples:
+            print(f'  {C_DIM_C}·{RESET}  {C_ACCENT}{ex:<44}{RESET}{DIM}{C_GRAY}{note}{RESET}')
+        print()
+        model_name = ask('Имя модели', default='openai/gpt-4o-mini')
 
     section('NICKNAME')
-    nickname = ask('Your nickname', default='user')
+    nickname = ask('Ваш никнейм', default='user')
 
     section('SYSTEM PROMPT')
-    print(f'  {DIM}{C_GRAY}Sent before every message. Leave blank for default.{RESET}\n')
-    use_sys = ask('Use a custom system prompt? (y/n)', default='n').lower()
+    print(f'  {DIM}{C_GRAY}Отправляется перед каждым запросом. Оставьте пустым для стандартного.{RESET}\n')
+    use_sys = ask('Использовать кастомный системный промпт? (y/n)', default='n').lower()
     system_prompt = ''
-    if use_sys in ('y', 'yes', '1'):
-        print(f'  {DIM}{C_GRAY}Type your prompt, press Enter twice to finish.{RESET}\n')
+    if use_sys in ('y', 'yes', '1', 'д', 'да'):
+        print(f'  {DIM}{C_GRAY}Введите промпт, нажмите Enter дважды для завершения.{RESET}\n')
         buf = []
         while True:
             ln = input('  ')
@@ -805,7 +741,7 @@ def setup_wizard():
 
     print()
     print(C_DIM_C + '─' * tw() + RESET)
-    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Setup complete! Starting OPENMODEL...{RESET}\n')
+    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Настройка завершена! Запуск OPENMODEL...{RESET}\n')
     time.sleep(1)
 
     c.execute(
@@ -836,16 +772,17 @@ chat_conn.commit()
 # ─── API check ────────────────────────────────────────────────────────────────
 def check_api():
     import socket
+    host = 'generativelanguage.googleapis.com' if is_google_key(api_key) else 'openrouter.ai'
     try:
         socket.setdefaulttimeout(3)
-        socket.gethostbyname('openrouter.ai')
+        socket.gethostbyname(host)
         return True
     except:
         return False
 
 API_AVAILABLE = check_api()
 
-# ─── OpenRouter streaming ─────────────────────────────────────────────────────
+# ─── System prompts ───────────────────────────────────────────────────────────
 def shell_guidance():
     if IS_WINDOWS:
         return (
@@ -887,6 +824,7 @@ def runtime_system_context():
         f"COMMAND GUIDANCE: {shell_guidance()}"
     )
 
+# ─── API Providers Streaming ──────────────────────────────────────────────────
 def stream_openrouter(messages, extra_system=None, control=None):
     if not API_AVAILABLE:
         yield '[API UNAVAILABLE] Cannot reach openrouter.ai'
@@ -949,6 +887,90 @@ def stream_openrouter(messages, extra_system=None, control=None):
         if control is not None:
             control.pop('response', None)
 
+def stream_google_gemini(messages, extra_system=None, control=None):
+    if not API_AVAILABLE:
+        yield '[API UNAVAILABLE] Cannot reach generativelanguage.googleapis.com'
+        return
+    sys_msg = extra_system or system_prompt or DEFAULT_SYS
+    sys_msg += f"\n\n{runtime_system_context()}"
+
+    gemini_contents = []
+    for m in messages:
+        role = "model" if m["role"] == "assistant" else "user"
+        gemini_contents.append({
+            "role": role,
+            "parts": [{"text": m["content"]}]
+        })
+
+    payload = {
+        "contents": gemini_contents,
+        "system_instruction": {
+            "parts": [{"text": sys_msg}]
+        }
+    }
+    
+    target_model = model_name.replace('models/', '')
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?alt=sse&key={api_key}"
+    headers = {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': api_key
+    }
+    
+    try:
+        in_reasoning = False
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as resp:
+            if control is not None:
+                control['response'] = resp
+            resp.encoding = 'utf-8'
+            if resp.status_code != 200:
+                yield f'[API ERROR] HTTP {resp.status_code}: {resp.text[:300]}'
+                return
+            for line in resp.iter_lines(decode_unicode=True):
+                if control is not None and control.get('cancelled'):
+                    return
+                if not line or not line.startswith('data: '):
+                    continue
+                chunk_str = line[6:].strip()
+                if not chunk_str or chunk_str == '[DONE]':
+                    continue
+                try:
+                    data = json.loads(chunk_str)
+                except json.JSONDecodeError:
+                    continue
+                
+                candidates = data.get('candidates', [])
+                if candidates:
+                    parts = candidates[0].get('content', {}).get('parts', [])
+                    for part in parts:
+                        is_thought = part.get('thought', False)
+                        text_val = part.get('text', '')
+                        if not text_val:
+                            continue
+                        if is_thought:
+                            if not in_reasoning:
+                                yield '<think>\n'
+                                in_reasoning = True
+                            yield text_val
+                        else:
+                            if in_reasoning:
+                                yield '\n</think>\n'
+                                in_reasoning = False
+                            yield text_val
+        if in_reasoning:
+            yield '\n</think>\n'
+    except Exception as e:
+        if control is not None and control.get('cancelled'):
+            return
+        yield f'[API ERROR] {e}'
+    finally:
+        if control is not None:
+            control.pop('response', None)
+
+def stream_ai(messages, extra_system=None, control=None):
+    if is_google_key(api_key):
+        return stream_google_gemini(messages, extra_system=extra_system, control=control)
+    return stream_openrouter(messages, extra_system=extra_system, control=control)
+
 # ─── System command helpers ───────────────────────────────────────────────────
 def get_desktop():
     if IS_WINDOWS:
@@ -1006,7 +1028,6 @@ def execute_command(cmd):
             return f"[ERROR] {e}"
     try:
         if IS_WINDOWS:
-            # chcp 65001 ensures Cyrillic paths and output work correctly
             full_cmd = f'chcp 65001 >nul 2>&1 & {cmd}'
             r = subprocess.run(
                 ['cmd.exe', '/c', full_cmd],
@@ -1037,7 +1058,7 @@ def confirm_exec(cmd):
     print('    ' + BG_CODE + C_TEAL + f'  {cmd:<{cw}}' + RESET)
     print()
     ans = input(f'  {C_YELLOW}Execute? (y/n):{RESET}  ').strip().lower()
-    return ans in ('y', 'yes', '1')
+    return ans in ('y', 'yes', '1', 'д', 'да')
 
 # ─── File helpers ─────────────────────────────────────────────────────────────
 READ_ONLY_COMMANDS = {
@@ -1094,7 +1115,6 @@ def detect_modify(text):
     return (m.group(1).strip('"\''), m.group(2).strip()) if m else (None, None)
 
 def detect_create_project(text):
-    """Detect create/build <X> by/from prompt/spec/readme <path>"""
     patterns = [
         r'(?:создай|сделай|напиши|разработай|сгенерируй|create|build|make|init|start|generate|develop|code|write|craete|creet)\s+.{0,50}?\s+(?:по|из|следуя|согласно|используя|на основе|by|from|using|following|with|based on)\s+(?:this\s+|этому?\s+)?(?:prompt|readme|spec|file|description|промту?|промпту?|файлу?|описанию?)?[:\s]*["\'](.+?)["\']',
         r'(?:создай|сделай|напиши|разработай|сгенерируй|create|build|make|init|start|generate|develop|code|write|craete|creet)\s+.{0,50}?\s+(?:по|из|следуя|согласно|используя|на основе|by|from|using|following|with|based on)\s+(?:this\s+|этому?\s+)?(?:prompt|readme|spec|file|description|промту?|промпту?|файлу?|описанию?)?[:\s]*([^\s"\']+(\.[a-zA-Z]+))',
@@ -1115,7 +1135,8 @@ def show_help():
         ('exit / quit',           'Exit OPENMODEL'),
         ('cls / clear',           'Back to home screen'),
         ('new',                   'Fresh conversation (reset context)'),
-        ('model <name>',          'Switch AI model (saved to config)'),
+        ('model',                 'List & switch AI models (Google/OpenRouter)'),
+        ('model <name/num>',      'Switch AI model directly'),
         ('history',               'Show last 10 conversations'),
         ('config',                'Show current configuration'),
         ('reset config',          'Delete config & re-run setup'),
@@ -1151,11 +1172,12 @@ def show_config():
     label = f'  {C_ACCENT}{BOLD}CONFIG{RESET}'
     print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
     print()
-    # Show full key so the user can see what they entered
+    provider_name = 'Google AI Studio' if is_google_key(api_key) else 'OpenRouter'
     key_disp = api_key
     sp_prev  = (system_prompt[:72] + '…') if len(system_prompt) > 72 \
                else (system_prompt or f'{DIM}{C_GRAY}(default){RESET}')
     rows = [
+        ('Provider',      provider_name),
         ('API key',       key_disp),
         ('Model',         model_name),
         ('Nickname',      nickname),
@@ -1224,15 +1246,30 @@ def main():
             time.sleep(1.5)
             break
 
-        if lower.startswith('model '):
-            nm = user_input[6:].strip()
-            if nm:
-                model_name = nm
+        if lower == 'model' or lower.startswith('model '):
+            arg = user_input[5:].strip()
+            if not arg and is_google_key(api_key):
+                new_model = select_google_model_interactive(api_key, default=model_name)
+                model_name = new_model
+                c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
+                conn.commit()
+                print(f'\n  {C_GREEN}✓{RESET}  Model switched → {C_ACCENT}{model_name}{RESET}\n')
+            elif arg:
+                if is_google_key(api_key) and arg.isdigit():
+                    models = fetch_google_models(api_key)
+                    val = int(arg)
+                    if 1 <= val <= len(models):
+                        model_name = models[val - 1]['id']
+                    else:
+                        print(f'\n  {C_RED}✗ Invalid number.{RESET}\n')
+                        continue
+                else:
+                    model_name = arg
                 c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
                 conn.commit()
                 print(f'\n  {C_GREEN}✓{RESET}  Model → {C_ACCENT}{model_name}{RESET}\n')
             else:
-                print(f'\n  {C_RED}Usage: model <model-name>{RESET}\n')
+                print(f'\n  {C_RED}Usage: model <model-name-or-number>{RESET}\n')
             continue
 
         if lower.startswith('cd '):
@@ -1247,20 +1284,17 @@ def main():
         # ── Create project by prompt ───────────────────────────────────────────
         proj_path = detect_create_project(user_input)
         if proj_path:
-            # Resolve path (handles spaces, Cyrillic, relative paths)
             proj_path = resolve_path(proj_path.strip())
             if not os.path.exists(proj_path):
                 print(f'\n  {C_RED}✗  File not found: {proj_path}{RESET}\n')
                 continue
 
-            # ── Read file SILENTLY via Python (no CMD, no confirmation) ────────
             try:
                 prompt_content = open(proj_path, encoding='utf-8', errors='replace').read()
             except Exception as e:
                 print(f'\n  {C_RED}✗  Cannot read file: {e}{RESET}\n')
                 continue
 
-            # Project dir = folder containing the prompt file
             project_dir = os.path.dirname(os.path.abspath(proj_path))
 
             project_sys = (
@@ -1286,7 +1320,7 @@ def main():
             try:
                 control = {}
                 full = print_ai_stream(
-                    stream_openrouter(
+                    stream_ai(
                         [{'role': 'user', 'content': build_prompt}],
                         extra_system=project_sys,
                         control=control
@@ -1295,7 +1329,6 @@ def main():
                     control
                 )
 
-                # ── Auto-create files (no confirmation needed) ─────────────
                 for rel_path, content in re.findall(
                         r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|CMD))|\Z)', full, re.DOTALL):
                     rel_path = clean_path(expand_special_path(rel_path))
@@ -1305,12 +1338,10 @@ def main():
                     open(abs_path, 'w', encoding='utf-8').write(clean_content(content) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{abs_path}{RESET}\n')
 
-                # ── Auto-execute setup commands (no confirmation) ──────────
                 for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
                     cmd = cmd.strip()
                     if not cmd:
                         continue
-                    # Run commands from project directory
                     orig_cwd = os.getcwd()
                     try:
                         os.chdir(project_dir)
@@ -1344,8 +1375,8 @@ def main():
                 prompt  = f'FILE PATH: {fp}\n\nCONTENT:\n```\n{content}\n```\n\nTASK: {task}'
                 control = {}
                 full    = print_ai_stream(
-                    stream_openrouter([{'role': 'user', 'content': prompt}],
-                                      extra_system=sys_m, control=control),
+                    stream_ai([{'role': 'user', 'content': prompt}],
+                              extra_system=sys_m, control=control),
                     model_name, control)
                 chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
                                (user_input, full))
@@ -1373,7 +1404,7 @@ def main():
                           'Shell cmd → [CMD]cmd[/CMD]')
                 control = {}
                 full = print_ai_stream(
-                    stream_openrouter([{'role': 'user', 'content': prompt}], control=control),
+                    stream_ai([{'role': 'user', 'content': prompt}], control=control),
                     model_name, control)
                 
                 m_old = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
@@ -1421,7 +1452,7 @@ def main():
             try:
                 control = {}
                 full = print_ai_stream(
-                    stream_openrouter(conversation, control=control),
+                    stream_ai(conversation, control=control),
                     model_name,
                     control
                 )
@@ -1471,7 +1502,6 @@ def main():
             for cmd in cmds:
                 cmd = cmd.strip()
                 if not cmd: continue
-                # Silent execution for safe reading commands
                 if is_read_only_command(cmd):
                     out = execute_command(cmd)
                     cmd_results.append(f"Result of `{cmd}`:\n```\n{out}\n```")
