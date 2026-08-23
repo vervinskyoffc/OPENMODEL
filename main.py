@@ -1,4 +1,4 @@
-import sqlite3, os, time, sys, requests, platform, json, io, subprocess, re, shutil, threading, textwrap, shlex, queue, signal
+import sqlite3, os, time, sys, requests, platform, json, io, subprocess, re, shutil, threading, textwrap, shlex, queue, signal, difflib
 from pathlib import Path
 from datetime import datetime
 
@@ -7,15 +7,14 @@ IS_WINDOWS = HOST_OS == "Windows"
 IS_LINUX = HOST_OS == "Linux"
 IS_MACOS = HOST_OS == "Darwin"
 
-# ─── Optional: prompt_toolkit for proper input wrap/indent ────────────────────
-try:
-    from prompt_toolkit import prompt as _pt_prompt
-    from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
-    _HAS_PT = True
-except ImportError:
-    _HAS_PT = False
+# ─── Fix Windows Console UTF-8 & ANSI ─────────────────────────────────────────
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
-# ─── Windows UTF-8 + VT100 ANSI fix ─────────────────────────────────────────
 if IS_WINDOWS:
     _VT_FLAGS = 0x0001 | 0x0002 | 0x0004
     _INVALID_HANDLE = -1
@@ -32,47 +31,55 @@ if IS_WINDOWS:
     except Exception:
         pass
 
-    sys.stdout.flush()
-    sys.stderr.flush()
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# ─── prompt_toolkit for autocompletion & inputs ──────────────────────────────
+try:
+    from prompt_toolkit import prompt as _pt_prompt
+    from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.history import InMemoryHistory
+    _HAS_PT = True
+    _COMMANDS = [
+        '/model', 'model', '/new', 'new', '/clear', 'clear', '/cls', 'cls',
+        '/help', 'help', '/tab', 'tab', '/history', 'history', '/config', 'config',
+        '/reset', 'reset', '/reset config', 'reset config',
+        '/exit', 'exit', '/quit', 'quit',
+        '/read', 'read file', '/modify', 'modify'
+    ]
+    _completer = WordCompleter(_COMMANDS, ignore_case=True, sentence=True)
+    _input_history = InMemoryHistory()
+except ImportError:
+    _HAS_PT = False
+    _completer = None
+    _input_history = None
 
-# ─── ANSI helpers ─────────────────────────────────────────────────────────────
+# ─── ANSI Palette ─────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 ITALIC = "\033[3m"
 
-def rgb(r, g, b):    return f"\033[38;2;{r};{g};{b}m"
-def bg_rgb(r, g, b): return f"\033[48;2;{r};{g};{b}m"
+def rgb(r, g, b): return f"\033[38;2;{r};{g};{b}m"
 
-C_WHITE   = rgb(226, 232, 240)
+C_WHITE   = rgb(241, 245, 249)
 C_GRAY    = rgb(148, 163, 184)
-C_DIM_C   = rgb(55,  65,  81)
-C_ACCENT  = rgb(56,  189, 248)
-C_ACCENT2 = rgb(167, 139, 250)
-C_GREEN   = rgb(34,  197, 94)
-C_RED     = rgb(248, 113, 113)
-C_YELLOW  = rgb(250, 204, 21)
-C_ORANGE  = rgb(251, 146, 60)
-C_TEAL    = rgb(45,  212, 191)
-C_BLUE    = rgb(96,  165, 250)
+C_DIM_C   = rgb(71,  85,  105)
+C_ACCENT  = rgb(56,  189, 248)    # Sky blue
+C_ACCENT2 = rgb(168, 85,  247)    # Purple
+C_GREEN   = rgb(34,  197, 94)     # Emerald
+C_RED     = rgb(239, 68,  68)     # Rose red
+C_YELLOW  = rgb(245, 158, 11)     # Amber
+C_TEAL    = rgb(20,  184, 166)
 
-BG_PANEL  = bg_rgb(20, 22, 26)
-BG_STATUS = bg_rgb(13, 17, 23)
-BG_CODE   = bg_rgb(9,  25, 29)
+BG_CODE   = "\033[48;2;15;23;42m"
+BG_SELECT = "\033[48;2;30;41;59m"
+VERSION   = "v3.3-fixed"
 
-VERSION = "v2.3-multi-provider"
-
-# ─── Terminal helpers ──────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 def tw():
-    return shutil.get_terminal_size((100, 30)).columns
-
-def th():
-    return shutil.get_terminal_size((100, 30)).lines
+    return max(60, shutil.get_terminal_size((100, 30)).columns)
 
 def strip_ansi(s):
-    return re.sub(r'\033\[[^m]*m', '', s)
+    return re.sub(r'\033\[[0-9;]*[mK]', '', s)
 
 def vis_len(s):
     return len(strip_ansi(s))
@@ -81,22 +88,16 @@ def ellipsize(text, max_len):
     text = str(text)
     if len(text) <= max_len:
         return text
-    if max_len <= 1:
-        return '…'
-    return '…' + text[-(max_len - 1):]
+    return text[:max(0, max_len - 1)] + '…' if max_len > 1 else '…'
 
 def os_label():
-    if IS_LINUX:
-        return "Linux"
-    if IS_MACOS:
-        return "macOS"
-    if IS_WINDOWS:
-        return "Windows"
+    if IS_LINUX:   return "Linux"
+    if IS_MACOS:   return "macOS"
+    if IS_WINDOWS: return "Windows"
     return HOST_OS
 
 def shell_label():
-    if IS_WINDOWS:
-        return "cmd.exe"
+    if IS_WINDOWS: return "cmd.exe"
     shell = os.environ.get("SHELL") or "/bin/sh"
     return os.path.basename(shell) or "sh"
 
@@ -106,12 +107,15 @@ def center_print(text, width=None):
     print(' ' * pad + text)
 
 def clear_screen():
-    sys.stdout.write('\033[3J\033[2J\033[H')
-    sys.stdout.flush()
+    if IS_WINDOWS:
+        os.system('cls')
+    else:
+        sys.stdout.write('\033[H\033[2J\033[3J')
+        sys.stdout.flush()
 
 def clean_content(text):
     text = text.strip()
-    m = re.match(r'^```[a-zA-Z0-9]*\n(.*?)```$', text, re.DOTALL)
+    m = re.match(r'^```[a-zA-Z0-9_-]*\n(.*?)```$', text, re.DOTALL)
     if m:
         return m.group(1).rstrip()
     return text
@@ -120,172 +124,329 @@ def clean_path(path):
     path = path.strip(" \t\r\n\"'`")
     return re.sub(r'[*?<>|]', '', path)
 
-def is_dummy_path(p):
-    if not p: return True
-    p = p.replace('\\', '/').strip().lower()
-    return p in ('path/to/file', 'path/relative/to/project', 'path', 'path/to/cmd', 'to cmd', 'path/to/file.ext', 'filename.ext', 'path/to')
+# ─── Stdin Flush & Key Reader ─────────────────────────────────────────────────
+def flush_stdin():
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
+
+def get_key():
+    """Reads a single keypress without buffering blocks."""
+    if IS_WINDOWS:
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ('\x00', '\xe0'):
+            ch2 = msvcrt.getwch()
+            if ch2 == 'H': return 'UP'
+            if ch2 == 'P': return 'DOWN'
+            if ch2 == 'K': return 'LEFT'
+            if ch2 == 'M': return 'RIGHT'
+            return ''
+        if ch in ('\r', '\n'): return 'ENTER'
+        if ch == '\t': return 'TAB'
+        if ch == '\x1b': return 'ESC'
+        if ch in ('\x08', '\x7f'): return 'BACKSPACE'
+        return ch
+    else:
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                import select
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if r:
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        ch3 = sys.stdin.read(1)
+                        if ch3 == 'A': return 'UP'
+                        if ch3 == 'B': return 'DOWN'
+                        if ch3 == 'C': return 'RIGHT'
+                        if ch3 == 'D': return 'LEFT'
+                return 'ESC'
+            if ch in ('\n', '\r'): return 'ENTER'
+            if ch == '\t': return 'TAB'
+            if ch in ('\x7f', '\x08'): return 'BACKSPACE'
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 # ─── Logo ─────────────────────────────────────────────────────────────────────
-LOGO_BIG = [
-    " ██████╗ ██████╗ ███████╗███╗   ██╗███╗   ███╗ ██████╗ ██████╗ ███████╗██╗     ",
-    "██╔═══██╗██╔══██╗██╔════╝████╗  ██║████╗ ████║██╔═══██╗██╔══██╗██╔════╝██║     ",
-    "██║   ██║██████╔╝█████╗  ██╔██╗ ██║██╔████╔██║██║   ██║██║  ██║█████╗  ██║     ",
-    "██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║╚██╔╝██║██║   ██║██║  ██║██╔══╝  ██║     ",
-    "╚██████╔╝██║     ███████╗██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝███████╗███████╗",
-    " ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝",
-]
-
-LOGO_MID = [
-    " ██████╗  ███╗   ███╗ ",
-    "██╔═══██╗ █████╗ ███║",
-    "██║   ██║ ██╔████╔██║",
-    "██║   ██║ ██║╚██╔╝██║",
-    "╚██████╔╝ ██║ ╚═╝ ██║",
-    " ╚═════╝  ╚═╝     ╚═╝",
+LOGO = [
+    "  ██████╗ ██████╗ ███████╗███╗   ██╗███╗   ███╗ ██████╗ ██████╗ ███████╗██╗     ",
+    " ██╔═══██╗██╔══██╗██╔════╝████╗  ██║████╗ ████║██╔═══██╗██╔══██╗██╔════╝██║     ",
+    " ██║   ██║██████╔╝█████╗  ██╔██╗ ██║██╔████╔██║██║   ██║██║  ██║█████╗  ██║     ",
+    " ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║╚██╔╝██║██║   ██║██║  ██║██╔══╝  ██║     ",
+    " ╚██████╔╝██║     ███████╗██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝███████╗███████╗",
+    "  ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝",
 ]
 
 def print_logo():
     W = tw()
     print()
-    big_w = len(LOGO_BIG[0])
-    mid_w = len(LOGO_MID[0])
-    if W >= big_w + 4:
-        for i, line in enumerate(LOGO_BIG):
-            ratio = i / max(len(LOGO_BIG) - 1, 1)
-            r = int(92  * (1 - ratio) + 180 * ratio)
-            g = int(158 * (1 - ratio) + 128 * ratio)
-            b = 255
-            pad = (W - big_w) // 2
-            print(' ' * pad + rgb(r, g, b) + BOLD + line + RESET)
-    elif W >= mid_w + 4:
-        for i, line in enumerate(LOGO_MID):
-            ratio = i / max(len(LOGO_MID) - 1, 1)
-            r = int(92  * (1 - ratio) + 180 * ratio)
-            g = int(158 * (1 - ratio) + 128 * ratio)
-            b = 255
-            pad = (W - mid_w) // 2
+    bw = len(LOGO[0])
+    if W >= bw + 2:
+        for i, line in enumerate(LOGO):
+            ratio = i / max(len(LOGO) - 1, 1)
+            r = int(56  * (1 - ratio) + 168 * ratio)
+            g = int(189 * (1 - ratio) + 85  * ratio)
+            b = int(248 * (1 - ratio) + 247 * ratio)
+            pad = (W - bw) // 2
             print(' ' * pad + rgb(r, g, b) + BOLD + line + RESET)
     else:
-        center_print(BOLD + C_ACCENT + 'OPENMODEL' + RESET)
+        center_print(BOLD + C_ACCENT + '◆ OPENMODEL ◆' + RESET)
     print()
 
-# ─── Panel ────────────────────────────────────────────────────────────────────
-def _pw():
-    return min(76, max(20, tw() - 6))
+# ─── Home Screen ──────────────────────────────────────────────────────────────
+def _pw(): return min(78, max(40, tw() - 6))
+def _pp(): return max(0, (tw() - _pw()) // 2)
 
-def _pp():
-    return max(0, (tw() - _pw()) // 2)
-
-def _panel_row(content='', use_accent=True, accent_col=None):
-    col = accent_col or C_ACCENT
+def _panel_row(content='', border_col=C_ACCENT):
     pw  = _pw()
     sp  = ' ' * _pp()
-    acc = (' ' + col + '▍' + RESET) if use_accent else '  '
+    bar = f"{border_col}│{RESET}"
+    inner_len = pw - 2
     vis = vis_len(content)
-    pad = ' ' * max(0, pw - vis - 1)
-    print(sp + BG_PANEL + acc + BG_PANEL + content + BG_PANEL + pad + RESET)
+    pad = ' ' * max(0, inner_len - vis)
+    print(f"{sp}{bar} {content}{pad}{bar}")
 
-def _panel_sep():
-    pw = _pw()
-    sp = ' ' * _pp()
-    print(sp + BG_PANEL + ' ' + C_DIM_C + '▍' + RESET +
-          BG_PANEL + C_DIM_C + '─' * (pw - 1) + RESET)
-
-def _panel_blank(dim=False):
-    col = C_DIM_C if dim else C_ACCENT
-    _panel_row(use_accent=True, accent_col=col)
-
-def _hints_line():
-    pw = _pw()
-    pp = _pp()
-    h  = (f'{DIM}{C_GRAY}tab{RESET} {C_GRAY}help'
-          f'   {DIM}{C_GRAY}new{RESET} {C_GRAY}chat'
-          f'   {DIM}{C_GRAY}model{RESET} {C_GRAY}switch'
-          f'   {DIM}{C_GRAY}exit{RESET} {C_GRAY}quit{RESET}')
-    hv  = vis_len(h)
-    pad = pp + pw + 2 - hv
-    print(' ' * max(0, pad) + h)
-
-def _panel_kv(label, value, value_color=C_WHITE):
-    content = (f' {DIM}{C_GRAY}{label:<8}{RESET}{BG_PANEL} '
-               f'{value_color}{value}{RESET}{BG_PANEL}')
-    _panel_row(content, use_accent=True, accent_col=C_DIM_C)
-
-# ─── Home screen ──────────────────────────────────────────────────────────────
-def _home_panel(model_name, api_ok):
-    cwd = ellipsize(os.getcwd().replace(str(Path.home()), '~'), max(18, _pw() - 16))
-    api = 'online' if api_ok else 'offline'
-    api_col = C_GREEN if api_ok else C_RED
-    provider = "Google AI Studio" if is_google_key(api_key) else "OpenRouter"
-    header = (f' {BOLD}{C_WHITE}OPENMODEL{RESET}{BG_PANEL}  '
-              f'{DIM}{C_GRAY}terminal AI workspace{RESET}{BG_PANEL}')
-    _panel_blank(dim=True)
-    _panel_row(header, use_accent=True, accent_col=C_TEAL)
-    _panel_sep()
-    _panel_kv('provider', provider, C_ACCENT2)
-    _panel_kv('model', ellipsize(model_name, max(12, _pw() - 16)), C_ACCENT)
-    _panel_kv('shell', f'{os_label()} / {shell_label()}', C_TEAL)
-    _panel_kv('api', f'● {api}', api_col)
-    _panel_kv('cwd', cwd, C_GRAY)
-    _panel_blank(dim=True)
-
-def render_home(model_name, api_ok):
+def render_home(model_name_val, api_ok):
     clear_screen()
     print_logo()
-    _home_panel(model_name, api_ok)
-    print()
-    _hints_line()
-    print()
+    pw = _pw()
+    sp = ' ' * _pp()
+    top = f"{sp}{C_ACCENT}╭{'─' * pw}╮{RESET}"
+    bot = f"{sp}{C_ACCENT}╰{'─' * pw}╯{RESET}"
+    mid = f"{sp}{C_DIM_C}├{'─' * pw}┤{RESET}"
 
-# ─── Conversation input ───────────────────────────────────────────────────────
-def read_input(nickname='You'):
+    api_str = f"{C_GREEN}● online{RESET}" if api_ok else f"{C_RED}● offline{RESET}"
+    prov_str = "Google AI Studio" if is_google_key(api_key) else "OpenRouter AI"
+    cwd_str = ellipsize(os.getcwd().replace(str(Path.home()), '~'), pw - 20)
+
+    print(top)
+    _panel_row(f"{BOLD}{C_WHITE}WORKSPACE INTERFACE{RESET}  {DIM}{C_GRAY}{VERSION}{RESET}")
+    print(mid)
+    _panel_row(f"{DIM}{C_GRAY}PROVIDER {RESET} {C_ACCENT2}{prov_str}{RESET}")
+    _panel_row(f"{DIM}{C_GRAY}MODEL    {RESET} {BOLD}{C_ACCENT}{ellipsize(model_name_val, pw - 18)}{RESET}")
+    _panel_row(f"{DIM}{C_GRAY}ENV      {RESET} {C_TEAL}{os_label()}{RESET} {DIM}({shell_label()}){RESET}")
+    _panel_row(f"{DIM}{C_GRAY}STATUS   {RESET} {api_str}")
+    _panel_row(f"{DIM}{C_GRAY}WORKDIR  {RESET} {C_WHITE}{cwd_str}{RESET}")
+    print(bot)
+
+    hints = (f"{DIM}{C_GRAY}Команды: {C_ACCENT}/model{C_GRAY} (смена модели) • "
+             f"{C_ACCENT}/help{C_GRAY} (помощь) • {C_ACCENT}/reset{C_GRAY} (сброс настроек) • {C_ACCENT}/new{C_GRAY} (новый чат){RESET}")
+    center_print(hints)
+    print()
+    sys.stdout.flush()
+
+# ─── Robust Interactive Model Selector ────────────────────────────────────────
+def interactive_model_selector(models_list: list[dict], current_model: str) -> str:
+    """Zero-flicker model selector supporting both Arrows and Direct Number selection."""
+    if not models_list:
+        models_list = fetch_fallback_google_models()
+
+    flush_stdin()
+    selected_idx = 0
+    for idx, m in enumerate(models_list):
+        if m['id'].lower() == (current_model or '').lower():
+            selected_idx = idx
+            break
+
+    page_size = min(9, len(models_list))
+    filter_query = ""
+
+    sys.stdout.write("\033[?25l")  # Hide cursor
+    sys.stdout.flush()
+    try:
+        while True:
+            filtered = [
+                m for m in models_list
+                if filter_query.lower() in m['id'].lower() or filter_query.lower() in m.get('name', '').lower()
+            ]
+            if not filtered:
+                filtered = models_list
+
+            selected_idx = max(0, min(selected_idx, len(filtered) - 1))
+            start_idx = max(0, min(selected_idx - page_size // 2, len(filtered) - page_size))
+            start_idx = max(0, start_idx)
+            end_idx = min(len(filtered), start_idx + page_size)
+            visible_items = filtered[start_idx:end_idx]
+
+            box_w = min(76, tw() - 6)
+            sp = "   "
+
+            # Construct the complete UI frame in memory to avoid screen tears
+            lines = []
+            lines.append("")
+            w_title = tw()
+            pad_t = max(0, (w_title - vis_len("ВЫБОР МОДЕЛИ ИИ")) // 2)
+            lines.append(' ' * pad_t + BOLD + C_ACCENT + "ВЫБОР МОДЕЛИ ИИ" + RESET)
+            sub = "Стрелки ↑/↓ или Цифры (1-9) | Выбор: ENTER/TAB | Отмена: ESC"
+            pad_s = max(0, (w_title - vis_len(sub)) // 2)
+            lines.append(' ' * pad_s + DIM + C_GRAY + sub + RESET)
+            lines.append("")
+
+            lines.append(f"{sp}{C_ACCENT}╭{'─' * box_w}╮{RESET}")
+            if filter_query:
+                q_vis = f" Поиск: {C_YELLOW}{filter_query}█{RESET}"
+                pad_q = " " * max(0, box_w - vis_len(q_vis))
+                lines.append(f"{sp}{C_ACCENT}│{RESET}{q_vis}{pad_q}{C_ACCENT}│{RESET}")
+                lines.append(f"{sp}{C_ACCENT}├{'─' * box_w}┤{RESET}")
+
+            for i, item in enumerate(visible_items):
+                actual_i = start_idx + i
+                is_cur = (actual_i == selected_idx)
+                mid = item['id']
+                desc = ellipsize(item.get('desc', ''), 28)
+                num_tag = f"[{actual_i + 1}]"
+
+                if is_cur:
+                    left_tag = f" {C_ACCENT}❯{RESET} {C_YELLOW}{num_tag:<4}{RESET} {BOLD}{C_WHITE}{mid:<30}{RESET}"
+                    desc_tag = f"{C_TEAL}{desc}{RESET}"
+                else:
+                    left_tag = f"   {DIM}{C_GRAY}{num_tag:<4}{RESET} {C_GRAY}{mid:<30}{RESET}"
+                    desc_tag = f"{DIM}{C_GRAY}{desc}{RESET}"
+
+                content = f"{left_tag} {desc_tag}"
+                pad = " " * max(0, box_w - vis_len(content))
+                lines.append(f"{sp}{C_ACCENT}│{RESET}{content}{pad}{C_ACCENT}│{RESET}")
+
+            footer = f" Модели {start_idx+1}-{end_idx} из {len(filtered)} "
+            f_pad = "─" * max(0, box_w - len(footer) - 2)
+            lines.append(f"{sp}{C_ACCENT}├{f_pad}{C_DIM_C}{footer}{C_ACCENT}─┤{RESET}")
+            lines.append(f"{sp}{C_ACCENT}╰{'─' * box_w}╯{RESET}")
+            lines.append("")
+
+            # Clear and print whole frame synchronously
+            clear_screen()
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+
+            key = get_key()
+            if key == 'UP':
+                selected_idx = (selected_idx - 1) % len(filtered)
+            elif key == 'DOWN':
+                selected_idx = (selected_idx + 1) % len(filtered)
+            elif key in ('ENTER', 'TAB'):
+                flush_stdin()
+                return filtered[selected_idx]['id']
+            elif key == 'ESC':
+                flush_stdin()
+                return current_model or filtered[0]['id']
+            elif key == 'BACKSPACE':
+                if filter_query:
+                    filter_query = filter_query[:-1]
+            elif key.isdigit():
+                val = int(key)
+                if 1 <= val <= len(filtered):
+                    flush_stdin()
+                    return filtered[val - 1]['id']
+            elif len(key) == 1 and key.isprintable():
+                filter_query += key
+    finally:
+        sys.stdout.write("\033[?25h")  # Ensure cursor is restored
+        sys.stdout.flush()
+
+# ─── Unified Diff Visualizer ──────────────────────────────────────────────────
+def display_file_diff(file_path: str, old_content: str, new_content: str, is_new=False):
+    """Prints a clean Git-style unified diff in the terminal."""
+    old_lines = old_content.splitlines(keepends=True) if old_content else []
+    new_lines = new_content.splitlines(keepends=True) if new_content else []
+    
+    diff = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{file_path}",
+        tofile=f"b/{file_path}",
+        n=2
+    ))
+
+    added = sum(1 for l in diff if l.startswith('+') and not l.startswith('+++'))
+    removed = sum(1 for l in diff if l.startswith('-') and not l.startswith('---'))
+
+    action = "Создан файл" if is_new else "Изменён файл"
+    badge_color = C_GREEN if is_new else C_YELLOW
+
+    W = min(tw() - 6, 88)
+    print()
+    print(f"  {badge_color}●{RESET} {BOLD}{C_WHITE}{action}:{RESET} {C_ACCENT}{file_path}{RESET} "
+          f"{DIM}({C_GREEN}+{added}{RESET}{DIM}, {C_RED}-{removed}{RESET}{DIM} строк){RESET}")
+    print(f"  {C_DIM_C}{'─' * W}{RESET}")
+
+    if not diff:
+        print(f"    {DIM}{C_GRAY}(Без изменений в тексте){RESET}")
+        print()
+        return
+
+    for line in diff[:60]:
+        line_clean = line.rstrip('\r\n')
+        if line.startswith('+++') or line.startswith('---'):
+            print(f"    {BOLD}{C_GRAY}{line_clean}{RESET}")
+        elif line.startswith('@@'):
+            print(f"    {C_TEAL}{line_clean}{RESET}")
+        elif line.startswith('+'):
+            print(f"    {C_GREEN}+ {line_clean[1:]}{RESET}")
+        elif line.startswith('-'):
+            print(f"    {C_RED}- {line_clean[1:]}{RESET}")
+        else:
+            print(f"    {DIM}{C_GRAY}  {line_clean}{RESET}")
+
+    if len(diff) > 60:
+        print(f"    {DIM}{C_YELLOW}... diff обрезан ({len(diff)-60} строк ещё) ...{RESET}")
+    print(f"  {C_DIM_C}{'─' * W}{RESET}\n")
+
+# ─── Conversation Input ───────────────────────────────────────────────────────
+def read_input(nickname_str='You'):
     now = datetime.now().strftime('%H:%M')
     print()
-    _msg_header(nickname, C_ACCENT, now)
-    print()
-
-    prompt_str = f'    {C_WHITE}'
-    sys.stdout.flush()
+    _msg_header(nickname_str, C_ACCENT, now)
+    prompt_str = f'  {C_ACCENT}❯{RESET} {C_WHITE}'
+    
     try:
         if _HAS_PT:
             user_input = _pt_prompt(
                 _PT_ANSI(prompt_str),
-                prompt_continuation='    ',
-                multiline=False,
+                completer=_completer,
+                history=_input_history,
+                multiline=False
             )
         else:
-            user_input = input(prompt_str)
+            sys.stdout.write(f"  {C_ACCENT}❯{RESET} ")
+            sys.stdout.flush()
+            user_input = input()
     except (EOFError, KeyboardInterrupt):
-        user_input = ''
-
+        return ''
+    
     sys.stdout.write(RESET)
-    print()
     return user_input.strip()
 
 # ─── Spinner ──────────────────────────────────────────────────────────────────
 def format_elapsed(seconds):
     mins = seconds // 60
     secs = seconds % 60
-    hrs = mins // 60
-    if hrs > 0:
-        return f"{hrs}h {mins%60}m {secs}s"
-    elif mins > 0:
-        return f"{mins}m {secs}s"
-    else:
-        return f"{secs}s"
+    return f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
 
 class Spinner:
     FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     def __init__(self, label='Thinking'):
-        self.label   = label
-        self._stop   = threading.Event()
+        self.label = label
+        self._stop = threading.Event()
         self._thread = None
         self._start_time = 0
         self.streamed_text = ''
 
     def update_text(self, text):
-        self.streamed_text = text
+        clean = re.sub(r'\[(NEW_FILE|EDIT_FILE|MODIFIED_FILE)[\s:\]].*?\[/\1\]', '[Обновление файлов...]', text, flags=re.DOTALL)
+        self.streamed_text = clean
 
     def _spin(self):
         i = 0
@@ -299,14 +460,13 @@ class Spinner:
             
             w = tw()
             prefix = f'\r  {C_ACCENT2}{f}{RESET}  {DIM}{C_GRAY}{self.label} [{td_str}] '
-            
-            max_snip_len = max(0, w - vis_len(prefix) - 5)
-            if len(snippet) > max_snip_len and max_snip_len > 3:
-                snippet = "..." + snippet[-(max_snip_len-3):]
-            elif len(snippet) > max_snip_len:
+            max_snip = max(0, w - vis_len(prefix) - 6)
+            if len(snippet) > max_snip and max_snip > 3:
+                snippet = "..." + snippet[-(max_snip-3):]
+            elif len(snippet) > max_snip:
                 snippet = ""
                 
-            line = prefix + snippet + RESET
+            line = prefix + f"{C_GRAY}{snippet}{RESET}"
             sys.stdout.write(line + ' ' * max(0, w - vis_len(line)) + '\r')
             sys.stdout.flush()
             time.sleep(0.08)
@@ -329,44 +489,57 @@ class Spinner:
 class RequestCancelled(Exception):
     pass
 
-# ─── Message display ──────────────────────────────────────────────────────────
+# ─── Formatting Chat Output ───────────────────────────────────────────────────
 def _msg_header(label, color, ts=None):
-    W   = tw()
+    W = tw()
     ts_str = f'  {DIM}{C_GRAY}{ts}{RESET}' if ts else ''
     hdr = f'  {color}{BOLD}{label}{RESET}{ts_str}'
     hv  = vis_len(hdr)
-    print(hdr + '  ' + C_DIM_C + '─' * max(0, W - hv - 2) + RESET)
+    print(hdr + '  ' + C_DIM_C + '─' * max(0, W - hv - 4) + RESET)
 
 def _ai_header(model_name_str):
     print()
     _msg_header(f'AI  ·  {model_name_str}', C_ACCENT2)
     print()
 
-# ─── Markdown renderer ────────────────────────────────────────────────────────
+def strip_code_tags_for_chat(text: str) -> str:
+    def rep_new(m):
+        path = m.group(1).strip()
+        return f"\n> 📁 **Создан файл:** `{path}`\n"
+    def rep_edit(m):
+        path = m.group(1).strip()
+        return f"\n> 📝 **Внесены правки в:** `{path}`\n"
+    def rep_cmd(m):
+        cmd = m.group(1).strip()
+        return f"\n> ⚡ **Команда:** `{cmd}`\n"
+
+    clean = re.sub(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|\Z)', rep_new, text, flags=re.DOTALL)
+    clean = re.sub(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|\Z)', rep_edit, clean, flags=re.DOTALL)
+    clean = re.sub(r'\[CMD\](.*?)\[/CMD\]', rep_cmd, clean, flags=re.DOTALL)
+    return clean
+
 def render_inline(line):
     line = re.sub(r'\*\*(.+?)\*\*', lambda m: BOLD + C_WHITE + m.group(1) + RESET + C_WHITE, line)
     line = re.sub(r'\*(.+?)\*',     lambda m: ITALIC + m.group(1) + RESET + C_WHITE, line)
-    line = re.sub(r'`([^`]+)`',
-                  lambda m: BG_CODE + C_TEAL + ' ' + m.group(1) + ' ' + RESET + C_WHITE,
-                  line)
+    line = re.sub(r'`([^`]+)`',     lambda m: BG_CODE + C_TEAL + ' ' + m.group(1) + ' ' + RESET + C_WHITE, line)
     return line
 
 def print_ai_response(text):
+    clean_text = strip_code_tags_for_chat(text)
     W     = tw()
     width = min(W - 8, 96)
-    lines = text.split('\n')
+    lines = clean_text.split('\n')
     in_code, lang, code_buf = False, '', []
     in_think = False
 
     def flush_code():
         nonlocal code_buf, lang
-        if not code_buf:
-            return
-        cw  = width
+        if not code_buf: return
+        cw = width
         hdr = f'  {lang if lang else "code"} '
         print('    ' + BG_CODE + C_TEAL + BOLD + hdr + ' ' * max(0, cw - len(hdr) + 2) + RESET)
         for cl in code_buf:
-            print('    ' + BG_CODE + C_TEAL + '  ' + cl + ' ' * max(0, cw - len(cl)) + RESET)
+            print('    ' + BG_CODE + C_WHITE + '  ' + cl + ' ' * max(0, cw - len(cl)) + RESET)
         print('    ' + BG_CODE + ' ' * (cw + 2) + RESET)
         code_buf.clear()
         lang = ''
@@ -392,7 +565,7 @@ def print_ai_response(text):
         if line.startswith('```'):
             if not in_code:
                 in_code = True
-                lang    = line[3:].strip()
+                lang = line[3:].strip()
             else:
                 in_code = False
                 flush_code()
@@ -417,9 +590,7 @@ def print_ai_response(text):
             indent = len(bul.group(1))
             marker = bul.group(2)
             rest   = bul.group(3)
-            pfx    = (f'    {"  " * (indent // 2)}{C_ACCENT}{marker}{RESET} '
-                      if re.match(r'\d+\.', marker)
-                      else f'    {"  " * (indent // 2)}{C_ACCENT}▸{RESET} ')
+            pfx = f'    {"  " * (indent // 2)}{C_ACCENT}▸{RESET} '
             pv = vis_len(pfx)
             for j, wl in enumerate(textwrap.wrap(rest, width - pv + 4) or ['']):
                 print((pfx if j == 0 else ' ' * pv) + tc + render_inline(wl) + RESET)
@@ -434,17 +605,16 @@ def print_ai_response(text):
     if in_code and code_buf:
         flush_code()
 
-# ─── Streaming printer ────────────────────────────────────────────────────────
+# ─── Streaming Engine ─────────────────────────────────────────────────────────
 def confirm_cancel_request():
     try:
-        ans = input(f'\n  {C_YELLOW}Точно отменить запрос? (Y/n):{RESET}  ').strip().lower()
+        ans = input(f'\n  {C_YELLOW}Отменить запрос? (y/N):{RESET}  ').strip().lower()
     except KeyboardInterrupt:
-        print()
         return True
-    return ans not in ('n', 'no', 'н', 'нет')
+    return ans in ('y', 'yes', 'д', 'да')
 
 def print_ai_stream(generator, mdl, control=None):
-    spinner = Spinner('Thinking')
+    spinner = Spinner('Генерация')
     full = ''
     start_time = time.time()
     token_queue = queue.Queue()
@@ -457,7 +627,7 @@ def print_ai_stream(generator, mdl, control=None):
     def sigint_handler(_signum, _frame):
         sigint_event.set()
 
-    def install_sigint_handler():
+    def install_sigint():
         nonlocal old_sigint, sigint_installed
         if threading.current_thread() is not threading.main_thread() or sigint_installed:
             return
@@ -465,7 +635,7 @@ def print_ai_stream(generator, mdl, control=None):
         signal.signal(signal.SIGINT, sigint_handler)
         sigint_installed = True
 
-    def restore_sigint_handler():
+    def restore_sigint():
         nonlocal sigint_installed
         if threading.current_thread() is threading.main_thread() and sigint_installed:
             signal.signal(signal.SIGINT, old_sigint)
@@ -476,16 +646,13 @@ def print_ai_stream(generator, mdl, control=None):
             control['cancelled'] = True
             resp = control.get('response')
             if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+                try: resp.close()
+                except Exception: pass
 
     def stream_worker():
         try:
             for token in generator:
-                if cancel_event.is_set():
-                    break
+                if cancel_event.is_set(): break
                 token_queue.put(('token', token))
         except BaseException as e:
             if not cancel_event.is_set():
@@ -493,76 +660,69 @@ def print_ai_stream(generator, mdl, control=None):
         finally:
             token_queue.put((done, None))
 
-    def handle_cancel_prompt():
+    def handle_cancel():
         spinner.stop()
-        restore_sigint_handler()
+        restore_sigint()
         try:
             should_cancel = confirm_cancel_request()
         finally:
-            install_sigint_handler()
+            install_sigint()
 
         if should_cancel:
             cancel_event.set()
             close_active_response()
             worker.join(timeout=1)
-            print(f'\n  {DIM}{C_GRAY}[Cancelled]{RESET}\n')
+            print(f'\n  {DIM}{C_GRAY}[Отменено]{RESET}\n')
             raise RequestCancelled()
 
         sigint_event.clear()
-        print(f'  {DIM}{C_GRAY}Continuing request...{RESET}')
+        print(f'  {DIM}{C_GRAY}Продолжение...{RESET}')
         spinner.start(reset_timer=False)
 
     worker = threading.Thread(target=stream_worker, daemon=True)
     worker.start()
-    install_sigint_handler()
+    install_sigint()
     spinner.start()
 
     try:
         while True:
             try:
                 while True:
-                    if sigint_event.is_set():
-                        raise KeyboardInterrupt()
+                    if sigint_event.is_set(): raise KeyboardInterrupt()
                     try:
                         kind, value = token_queue.get(timeout=0.05)
                     except queue.Empty:
                         continue
-                    if sigint_event.is_set():
-                        raise KeyboardInterrupt()
-
-                    if kind is done:
-                        break
-                    if kind == 'error':
-                        raise value
+                    if sigint_event.is_set(): raise KeyboardInterrupt()
+                    if kind is done: break
+                    if kind == 'error': raise value
 
                     full += value
                     spinner.update_text(full)
                 break
             except KeyboardInterrupt:
-                handle_cancel_prompt()
+                handle_cancel()
                 continue
     finally:
-        restore_sigint_handler()
+        restore_sigint()
         spinner.stop()
 
     elapsed = int(time.time() - start_time)
-
     if full.strip():
         _ai_header(mdl)
-        print()
         print_ai_response(full)
         print()
         td_str = format_elapsed(elapsed)
-        print(f'    {DIM}{C_GRAY}Thought for {td_str}{RESET}\n')
+        print(f'    {DIM}{C_GRAY}Выполнено за {td_str}{RESET}\n')
     return full
 
-# ─── Config DB ────────────────────────────────────────────────────────────────
+# ─── Config Database ──────────────────────────────────────────────────────────
 USERDATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "userdata")
 os.makedirs(USERDATA_DIR, exist_ok=True)
 
 CONFIG_DB = os.path.join(USERDATA_DIR, 'config.db')
 conn = sqlite3.connect(CONFIG_DB)
-c    = conn.cursor()
+c = conn.cursor()
 c.execute("""CREATE TABLE IF NOT EXISTS config (
                 id INTEGER PRIMARY KEY,
                 api_key TEXT,
@@ -571,187 +731,105 @@ c.execute("""CREATE TABLE IF NOT EXISTS config (
                 system_prompt TEXT DEFAULT ''
             )""")
 conn.commit()
-c.execute('SELECT api_key, model, nickname, system_prompt FROM config WHERE id=1')
-row = c.fetchone()
 
-# ─── Google AI Studio helpers ─────────────────────────────────────────────────
+# ─── Model Fetching & Fallbacks ───────────────────────────────────────────────
 def is_google_key(k: str) -> bool:
-    if not k:
-        return False
+    if not k: return False
     k = k.strip()
-    # Поддерживаем новые ключи AQ., стандартные AIza и любые не-OpenRouter ключи
-    if k.startswith(('AQ.', 'AQ', 'AIza')):
-        return True
-    if not k.startswith('sk-or-') and len(k) >= 28:
-        return True
-    return False
+    return k.startswith(('AQ.', 'AQ', 'AIza')) or (not k.startswith('sk-or-') and len(k) >= 28)
 
-def model_sort_key(item: dict) -> tuple:
-    mid = item['id'].lower()
-    # Извлекаем версию (2.7, 2.6, 2.5, 2.0, 1.5 и т.д.)
-    ver_match = re.search(r'gemini-(\d+(?:\.\d+)?)', mid)
-    ver = float(ver_match.group(1)) if ver_match else 0.0
-    is_exp = 1 if ('exp' in mid or 'preview' in mid or 'thinking' in mid) else 0
-    is_flash = 1 if 'flash' in mid else 0
-    is_pro = 1 if 'pro' in mid else 0
-    return (ver, is_flash, is_pro, is_exp)
+def fetch_fallback_google_models():
+    return [
+        {'id': 'gemini-2.0-flash',      'desc': 'Флагман скорости и качества (рекомендуется)'},
+        {'id': 'gemini-2.0-flash-lite', 'desc': 'Максимально быстрая и легкая'},
+        {'id': 'gemini-1.5-flash',      'desc': 'Высокая пропускная способность'},
+        {'id': 'gemini-1.5-pro',        'desc': 'Сложные задачи и большой контекст'},
+    ]
 
 def fetch_google_models(key: str) -> list[dict]:
-    """Получить ВСЕ доступные модели Google AI Studio, поддерживающие генерацию текста"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-    headers = {'x-goog-api-key': key}
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers={'x-goog-api-key': key}, timeout=4)
         if r.status_code == 200:
-            data = r.json()
             models = []
-            for m in data.get('models', []):
+            for m in r.json().get('models', []):
                 methods = m.get('supportedGenerationMethods', [])
                 name = m.get('name', '').replace('models/', '')
-                # Отбираем модели для диалогов/генерации контента
-                if 'generateContent' in methods and 'gemini' in name.lower():
+                low = name.lower()
+                
+                if any(x in low for x in ('tts', 'audio', 'image', 'embedding', 'aqa', 'realtime', 'imagen')):
+                    continue
+
+                if 'generateContent' in methods and 'gemini' in low:
                     desc = m.get('description', '').split('.')[0]
                     models.append({
                         'id': name,
                         'name': m.get('displayName', name),
                         'desc': desc
                     })
-            # Сортируем от самых новых версий к старым
-            models.sort(key=model_sort_key, reverse=True)
-            return models
+            if models:
+                return models
     except Exception:
         pass
-    return []
+    return fetch_fallback_google_models()
 
-def select_google_model_interactive(key: str, default=None) -> str:
-    print(f'\n  {C_TEAL}⏳ Получаю список всех доступных моделей Google AI Studio...{RESET}')
-    models = fetch_google_models(key)
-    
-    if not models:
-        # Резервный список на случай сетевых сбоев
-        models = [
-            {'id': 'gemini-2.5-flash', 'name': 'Gemini 2.5 Flash', 'desc': 'Next-gen fast model'},
-            {'id': 'gemini-2.0-flash', 'name': 'Gemini 2.0 Flash', 'desc': 'Fast and powerful'},
-            {'id': 'gemini-2.0-flash-lite', 'name': 'Gemini 2.0 Flash-Lite', 'desc': 'Lightweight'},
-            {'id': 'gemini-1.5-flash', 'name': 'Gemini 1.5 Flash', 'desc': 'Fast, general purpose'},
-            {'id': 'gemini-1.5-pro', 'name': 'Gemini 1.5 Pro', 'desc': 'Complex reasoning'},
-        ]
+def fetch_openrouter_models() -> list[dict]:
+    return [
+        {'id': 'openai/gpt-4o-mini',               'desc': 'Быстрая и умная модель'},
+        {'id': 'openai/gpt-4o',                    'desc': 'Флагман OpenAI'},
+        {'id': 'anthropic/claude-3.5-sonnet',      'desc': 'Лучшая для программирования'},
+        {'id': 'deepseek/deepseek-r1',              'desc': 'Продвинутое рассуждение'},
+        {'id': 'meta-llama/llama-3.3-70b-instruct','desc': 'Мощная Open-source модель'},
+    ]
 
-    print(f'\n  {BOLD}{C_ACCENT}Доступные модели Google AI Studio ({len(models)} шт.):{RESET}')
-    for idx, m in enumerate(models, 1):
-        num_str = f"[{idx}]"
-        desc_str = f" — {m['desc']}" if m['desc'] else ""
-        print(f'  {C_ACCENT2}{num_str:>5}{RESET}  {C_ACCENT}{m["id"]:<32}{RESET}{DIM}{C_GRAY}{desc_str}{RESET}')
-    print()
+def select_model_menu(current=None):
+    if is_google_key(api_key):
+        models = fetch_google_models(api_key)
+    else:
+        models = fetch_openrouter_models()
+    return interactive_model_selector(models, current or model_name)
 
-    dflt_idx = 1
-    if default:
-        for i, m in enumerate(models, 1):
-            if m['id'].lower() == default.lower():
-                dflt_idx = i
-                break
-
-    while True:
-        sys.stdout.write(f'  {C_ACCENT}❯{RESET}  {C_WHITE}Введите номер модели или имя [{dflt_idx}]:{RESET}  ')
-        sys.stdout.flush()
-        choice = input().strip()
-        if not choice:
-            return models[dflt_idx - 1]['id']
-        if choice.isdigit():
-            val = int(choice)
-            if 1 <= val <= len(models):
-                return models[val - 1]['id']
-        # Если пользователь ввел точное имя модели (включая любую кастомную)
-        for m in models:
-            if choice.lower() == m['id'].lower():
-                return m['id']
-        # Разрешаем ввод любого кастомного идентификатора модели
-        if 'gemini' in choice.lower():
-            return choice
-        print(f'  {C_RED}✗ Неверный выбор. Введите число от 1 до {len(models)} или имя модели.{RESET}')
-
-# ─── Setup wizard ─────────────────────────────────────────────────────────────
+# ─── Setup Wizard ─────────────────────────────────────────────────────────────
 def setup_wizard():
     clear_screen()
-    print('\n' * 3)
-    center_print(C_ACCENT + BOLD + 'OPENMODEL  —  First-time setup' + RESET)
-    center_print(DIM + C_GRAY + 'Поддерживает OpenRouter и Google AI Studio' + RESET)
-    print()
-    print(C_DIM_C + '─' * tw() + RESET)
+    print_logo()
+    center_print(BOLD + C_WHITE + "ПЕРВОНАЧАЛЬНАЯ НАСТРОЙКА" + RESET)
+    center_print(DIM + C_GRAY + "Поддерживает Google AI Studio и OpenRouter" + RESET)
     print()
 
     def ask(prompt_text, default=None):
         dflt = f'{DIM}{C_GRAY} [{default}]{RESET}' if default else ''
-        sys.stdout.write(f'  {C_ACCENT}❯{RESET}  {C_WHITE}{prompt_text}{RESET}{dflt}\n'
-                         f'  {C_DIM_C}└─{RESET}  ')
+        sys.stdout.write(f'  {C_ACCENT}❯{RESET} {C_WHITE}{prompt_text}{RESET}{dflt}: ')
         sys.stdout.flush()
         val = input().strip()
         return val if val else (default or '')
 
-    def section(label):
-        print()
-        print(f'  {BOLD}{C_ACCENT}{label}{RESET}')
-        print(f'  {C_DIM_C}{"─" * 44}{RESET}')
+    flush_stdin()
+    api_k = ask('Введите ваш API Ключ')
+    while not api_k:
+        api_k = ask('Введите ваш API Ключ')
 
-    section('API KEY (GOOGLE AI STUDIO или OPENROUTER)')
-    print(f'  {DIM}{C_GRAY}• Google AI Studio (Free): https://aistudio.google.com/app/apikey{RESET}')
-    print(f'  {DIM}{C_GRAY}• OpenRouter:             https://openrouter.ai/keys{RESET}\n')
-
-    api_key = ask('Вставьте ваш API ключ')
-    while not api_key:
-        print(C_RED + '  ✗  Ключ не может быть пустым.' + RESET)
-        api_key = ask('Вставьте ваш API ключ')
-
-    preview = api_key[:8] + '·' * min(12, max(0, len(api_key) - 12)) + api_key[-4:]
-    provider_title = "Google AI Studio" if is_google_key(api_key) else "OpenRouter"
-    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Ключ сохранен ({provider_title}):{RESET}  {C_ACCENT}{preview}{RESET}')
-
-    section('ВЫБОР МОДЕЛИ')
-    if is_google_key(api_key):
-        model_name = select_google_model_interactive(api_key)
+    if is_google_key(api_k):
+        models_available = fetch_google_models(api_k)
+        selected_model = interactive_model_selector(models_available, 'gemini-2.0-flash')
     else:
-        examples = [
-            ('openai/gpt-4o-mini',                'fast & cheap (default)'),
-            ('anthropic/claude-3-haiku',           'smart & concise'),
-            ('deepseek/deepseek-r1',               'reasoning'),
-            ('meta-llama/llama-3.1-70b-instruct',  'open-source'),
-        ]
-        print()
-        for ex, note in examples:
-            print(f'  {C_DIM_C}·{RESET}  {C_ACCENT}{ex:<44}{RESET}{DIM}{C_GRAY}{note}{RESET}')
-        print()
-        model_name = ask('Имя модели', default='openai/gpt-4o-mini')
+        models_available = fetch_openrouter_models()
+        selected_model = interactive_model_selector(models_available, 'openai/gpt-4o-mini')
 
-    section('NICKNAME')
-    nickname = ask('Ваш никнейм', default='user')
+    clear_screen()
+    print_logo()
+    flush_stdin()
+    nick = ask('Ваш никнейм', default='Dev')
 
-    section('SYSTEM PROMPT')
-    print(f'  {DIM}{C_GRAY}Отправляется перед каждым запросом. Оставьте пустым для стандартного.{RESET}\n')
-    use_sys = ask('Использовать кастомный системный промпт? (y/n)', default='n').lower()
-    system_prompt = ''
-    if use_sys in ('y', 'yes', '1', 'д', 'да'):
-        print(f'  {DIM}{C_GRAY}Введите промпт, нажмите Enter дважды для завершения.{RESET}\n')
-        buf = []
-        while True:
-            ln = input('  ')
-            if ln == '' and buf and buf[-1] == '':
-                break
-            buf.append(ln)
-        system_prompt = '\n'.join(buf).strip()
-
-    print()
-    print(C_DIM_C + '─' * tw() + RESET)
-    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Настройка завершена! Запуск OPENMODEL...{RESET}\n')
-    time.sleep(1)
-
-    c.execute(
-        'INSERT INTO config (id, api_key, model, nickname, system_prompt) VALUES (1,?,?,?,?)',
-        (api_key, model_name, nickname, system_prompt)
-    )
+    c.execute('DELETE FROM config WHERE id=1')
+    c.execute('INSERT INTO config (id, api_key, model, nickname, system_prompt) VALUES (1,?,?,?,?)',
+              (api_k, selected_model, nick, ''))
     conn.commit()
-    return api_key, model_name, nickname, system_prompt
+    return api_k, selected_model, nick, ''
 
-# ─── Load or run setup ────────────────────────────────────────────────────────
+# ─── Load Config ──────────────────────────────────────────────────────────────
+c.execute('SELECT api_key, model, nickname, system_prompt FROM config WHERE id=1')
+row = c.fetchone()
 if row:
     api_key, model_name, nickname, system_prompt = row
 else:
@@ -760,7 +838,7 @@ else:
 # ─── Chat DB ──────────────────────────────────────────────────────────────────
 CHATS_DB = os.path.join(USERDATA_DIR, 'chats.db')
 chat_conn = sqlite3.connect(CHATS_DB)
-chat_c    = chat_conn.cursor()
+chat_c = chat_conn.cursor()
 chat_c.execute("""CREATE TABLE IF NOT EXISTS chats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_input TEXT,
@@ -769,7 +847,7 @@ chat_c.execute("""CREATE TABLE IF NOT EXISTS chats (
                 )""")
 chat_conn.commit()
 
-# ─── API check ────────────────────────────────────────────────────────────────
+# ─── API Check ────────────────────────────────────────────────────────────────
 def check_api():
     import socket
     host = 'generativelanguage.googleapis.com' if is_google_key(api_key) else 'openrouter.ai'
@@ -782,742 +860,394 @@ def check_api():
 
 API_AVAILABLE = check_api()
 
-# ─── System prompts ───────────────────────────────────────────────────────────
+# ─── System Prompt ────────────────────────────────────────────────────────────
 def shell_guidance():
     if IS_WINDOWS:
-        return (
-            "The command shell is Windows CMD. Use `dir` and `type` for reading files. "
-            "Use `%DESKTOP%` for the Desktop path. Quote paths with spaces."
-        )
-    return (
-        "The command shell is Linux/POSIX. Prefer `ls`, `cat`, `sed -n`, `grep`/`rg`, "
-        "`python3`, and `python3 -m pip`. Use `~/Desktop`, `$DESKTOP`, or absolute "
-        "paths for Desktop. Quote paths with spaces. Do not use Windows CMD syntax."
-    )
+        return "Shell: Windows CMD. Use `dir`, `type`. Paths with spaces must be quoted."
+    return "Shell: POSIX. Use `ls`, `cat`, `grep`, `find`, `python3`."
 
 def default_system_prompt():
     return (
-        "You are a helpful AI assistant with full access to the user's computer. "
-        "To create a new file, use EXACTLY this format:\n"
-        "[NEW_FILE: path/to/file]\n...file content...\n[/NEW_FILE]\n"
-        "To modify an existing file, use EXACTLY this format:\n"
-        "[EDIT_FILE: path/to/file]\n...full new content...\n[/EDIT_FILE]\n"
-        "Directories are created automatically, do NOT use [CMD] mkdir.\n"
-        "Do NOT wrap file content in markdown code blocks. NO ```python, NO ```!\n"
-        "Write the RAW file content directly inside the tags.\n"
-        "Apply changes directly using [EDIT_FILE]. Do NOT create temporary files.\n"
-        "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
-        "You will receive the command output in the next message. "
-        "Read-only inspection commands may execute silently in the background.\n"
-        f"{shell_guidance()} "
-        "Format other responses with markdown. Always confirm before destructive actions."
+        "You are OPENMODEL — an Autonomous Lead Software Engineer and CLI agent.\n\n"
+        "### RULES FOR FILE CREATION & EDITING:\n"
+        "1. NEW FILE:\n"
+        "[NEW_FILE: path/to/file.ext]\n"
+        "RAW_FILE_CONTENT\n"
+        "[/NEW_FILE]\n\n"
+        "2. EDIT EXISTING FILE:\n"
+        "[EDIT_FILE: path/to/file.ext]\n"
+        "RAW_FULL_NEW_FILE_CONTENT\n"
+        "[/EDIT_FILE]\n\n"
+        "3. RUN COMMANDS:\n"
+        "[CMD]command[/CMD]\n\n"
+        "4. DO NOT print the code in normal chat markdown when using [NEW_FILE] or [EDIT_FILE]. "
+        "The CLI parses your tags and displays a beautiful unified git diff (+ / -) to the user. "
+        "Provide only concise explanations outside tags.\n"
+        f"5. {shell_guidance()}"
     )
 
 DEFAULT_SYS = default_system_prompt()
 
 def runtime_system_context():
-    return (
-        f"CURRENT DIRECTORY: {os.getcwd()}\n"
-        f"OPERATING SYSTEM: {os_label()}\n"
-        f"SHELL: {shell_label()}\n"
-        f"DESKTOP DIRECTORY: {get_desktop()}\n"
-        f"COMMAND GUIDANCE: {shell_guidance()}"
-    )
+    return f"CURRENT WORKDIR: {os.getcwd()}\nPLATFORM: {os_label()} ({shell_label()})\nDESKTOP: {get_desktop()}"
 
-# ─── API Providers Streaming ──────────────────────────────────────────────────
+# ─── Stream Providers ─────────────────────────────────────────────────────────
 def stream_openrouter(messages, extra_system=None, control=None):
     if not API_AVAILABLE:
-        yield '[API UNAVAILABLE] Cannot reach openrouter.ai'
+        yield '[API ERROR] OpenRouter недоступен.'
         return
-    headers = {'Authorization': f'Bearer {api_key}',
-               'Content-Type': 'application/json',
-               'HTTP-Referer': 'https://openrouter.ai'}
-    sys_msg = extra_system or system_prompt or DEFAULT_SYS
-    sys_msg += f"\n\n{runtime_system_context()}"
-    payload = {'model': model_name,
-               'messages': [{'role': 'system', 'content': sys_msg}] + messages,
-               'stream': True,
-               'include_reasoning': True}
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://openrouter.ai'
+    }
+    sys_msg = (extra_system or system_prompt or DEFAULT_SYS) + f"\n\n{runtime_system_context()}"
+    payload = {
+        'model': model_name,
+        'messages': [{'role': 'system', 'content': sys_msg}] + messages,
+        'stream': True,
+        'include_reasoning': True
+    }
     try:
         in_reasoning = False
         with requests.post('https://openrouter.ai/api/v1/chat/completions',
                            headers=headers, json=payload, stream=True, timeout=60) as resp:
-            if control is not None:
-                control['response'] = resp
+            if control is not None: control['response'] = resp
             resp.encoding = 'utf-8'
             if resp.status_code != 200:
-                yield f'[API ERROR] HTTP {resp.status_code}: {resp.text[:300]}'
+                yield f'[API ERROR] HTTP {resp.status_code}: {resp.text[:250]}'
                 return
             for line in resp.iter_lines(decode_unicode=True):
-                if control is not None and control.get('cancelled'):
-                    return
-                if not line or line.startswith(':'):
-                    continue
-                if line.startswith('data: '):
-                    line = line[6:]
-                if not line or line == '[DONE]':
-                    continue
+                if control and control.get('cancelled'): return
+                if not line or not line.startswith('data: '): continue
+                chunk_str = line[6:].strip()
+                if chunk_str == '[DONE]': break
                 try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if 'choices' in data and data['choices']:
+                    data = json.loads(chunk_str)
                     delta = data['choices'][0].get('delta', {})
-                    reasoning_chunk = delta.get('reasoning', '')
-                    content_chunk = delta.get('content', '')
-                    
-                    if reasoning_chunk:
+                    r_tok = delta.get('reasoning', '')
+                    c_tok = delta.get('content', '')
+                    if r_tok:
                         if not in_reasoning:
-                            yield '<think>\n'
-                            in_reasoning = True
-                        yield reasoning_chunk
-                        
-                    if content_chunk:
+                            yield '<think>\n'; in_reasoning = True
+                        yield r_tok
+                    if c_tok:
                         if in_reasoning:
-                            yield '\n</think>\n'
-                            in_reasoning = False
-                        yield content_chunk
+                            yield '\n</think>\n'; in_reasoning = False
+                        yield c_tok
+                except Exception:
+                    continue
         if in_reasoning:
             yield '\n</think>\n'
     except Exception as e:
-        if control is not None and control.get('cancelled'):
-            return
+        if control and control.get('cancelled'): return
         yield f'[API ERROR] {e}'
-    finally:
-        if control is not None:
-            control.pop('response', None)
 
 def stream_google_gemini(messages, extra_system=None, control=None):
     if not API_AVAILABLE:
-        yield '[API UNAVAILABLE] Cannot reach generativelanguage.googleapis.com'
+        yield '[API ERROR] Google AI Studio недоступен.'
         return
-    sys_msg = extra_system or system_prompt or DEFAULT_SYS
-    sys_msg += f"\n\n{runtime_system_context()}"
-
-    gemini_contents = []
+    sys_msg = (extra_system or system_prompt or DEFAULT_SYS) + f"\n\n{runtime_system_context()}"
+    contents = []
     for m in messages:
-        role = "model" if m["role"] == "assistant" else "user"
-        gemini_contents.append({
-            "role": role,
+        contents.append({
+            "role": "model" if m["role"] == "assistant" else "user",
             "parts": [{"text": m["content"]}]
         })
 
     payload = {
-        "contents": gemini_contents,
-        "system_instruction": {
-            "parts": [{"text": sys_msg}]
-        }
+        "contents": contents,
+        "system_instruction": {"parts": [{"text": sys_msg}]}
     }
-    
-    target_model = model_name.replace('models/', '')
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?alt=sse&key={api_key}"
-    headers = {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': api_key
-    }
+    target = model_name.replace('models/', '')
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target}:streamGenerateContent?alt=sse&key={api_key}"
     
     try:
         in_reasoning = False
-        with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as resp:
-            if control is not None:
-                control['response'] = resp
+        with requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, stream=True, timeout=60) as resp:
+            if control is not None: control['response'] = resp
             resp.encoding = 'utf-8'
             if resp.status_code != 200:
                 yield f'[API ERROR] HTTP {resp.status_code}: {resp.text[:300]}'
                 return
             for line in resp.iter_lines(decode_unicode=True):
-                if control is not None and control.get('cancelled'):
-                    return
-                if not line or not line.startswith('data: '):
-                    continue
-                chunk_str = line[6:].strip()
-                if not chunk_str or chunk_str == '[DONE]':
-                    continue
+                if control and control.get('cancelled'): return
+                if not line or not line.startswith('data: '): continue
+                raw = line[6:].strip()
+                if not raw or raw == '[DONE]': continue
                 try:
-                    data = json.loads(chunk_str)
-                except json.JSONDecodeError:
-                    continue
-                
-                candidates = data.get('candidates', [])
-                if candidates:
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    for part in parts:
-                        is_thought = part.get('thought', False)
-                        text_val = part.get('text', '')
-                        if not text_val:
-                            continue
-                        if is_thought:
+                    data = json.loads(raw)
+                    parts = data.get('candidates', [])[0].get('content', {}).get('parts', [])
+                    for p in parts:
+                        text_val = p.get('text', '')
+                        if not text_val: continue
+                        if p.get('thought', False):
                             if not in_reasoning:
-                                yield '<think>\n'
-                                in_reasoning = True
+                                yield '<think>\n'; in_reasoning = True
                             yield text_val
                         else:
                             if in_reasoning:
-                                yield '\n</think>\n'
-                                in_reasoning = False
+                                yield '\n</think>\n'; in_reasoning = False
                             yield text_val
+                except Exception:
+                    continue
         if in_reasoning:
             yield '\n</think>\n'
     except Exception as e:
-        if control is not None and control.get('cancelled'):
-            return
+        if control and control.get('cancelled'): return
         yield f'[API ERROR] {e}'
-    finally:
-        if control is not None:
-            control.pop('response', None)
 
 def stream_ai(messages, extra_system=None, control=None):
     if is_google_key(api_key):
         return stream_google_gemini(messages, extra_system=extra_system, control=control)
     return stream_openrouter(messages, extra_system=extra_system, control=control)
 
-# ─── System command helpers ───────────────────────────────────────────────────
+# ─── Execution Helpers ────────────────────────────────────────────────────────
 def get_desktop():
     if IS_WINDOWS:
         try:
             import winreg
-            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')
             d, _ = winreg.QueryValueEx(k, 'Desktop')
             winreg.CloseKey(k)
-            if os.path.exists(d):
-                return d
-        except:
-            pass
-        for p in [Path.home() / 'Desktop', Path.home() / 'OneDrive' / 'Desktop']:
-            if p.exists():
-                return str(p)
+            if os.path.exists(d): return d
+        except: pass
         return os.path.expandvars(r'%USERPROFILE%\Desktop')
-    xdg_cfg = Path.home() / '.config' / 'user-dirs.dirs'
-    try:
-        if xdg_cfg.exists():
-            for line in xdg_cfg.read_text(encoding='utf-8', errors='replace').splitlines():
-                if line.startswith('XDG_DESKTOP_DIR='):
-                    value = line.split('=', 1)[1].strip().strip('"')
-                    value = value.replace('$HOME', str(Path.home()))
-                    desktop = os.path.expandvars(os.path.expanduser(value))
-                    if desktop:
-                        return desktop
-    except Exception:
-        pass
     return str(Path.home() / 'Desktop')
 
-def expand_desktop_token(text):
-    desktop = get_desktop()
-    text = str(text).replace('%DESKTOP%', desktop)
-    return re.sub(r'\$\{DESKTOP\}|\$DESKTOP\b', lambda _m: desktop, text)
+def expand_special_path(p):
+    p = str(p).replace('%DESKTOP%', get_desktop()).replace('$DESKTOP', get_desktop())
+    return os.path.expandvars(os.path.expanduser(p)).strip(' "\'')
 
-def expand_special_path(path):
-    path = expand_desktop_token(path).strip().strip('"\'')
-    return os.path.expandvars(os.path.expanduser(path))
-
-def command_env():
-    env = os.environ.copy()
-    env['DESKTOP'] = get_desktop()
-    env.setdefault('PYTHONUTF8', '1')
-    return env
+def resolve_path(path, base_dir=None):
+    clean = clean_path(expand_special_path(path))
+    return clean if os.path.isabs(clean) else os.path.join(base_dir or os.getcwd(), clean)
 
 def execute_command(cmd):
-    cmd = expand_desktop_token(cmd)
-    if cmd.lower().strip().startswith('cd '):
-        target = expand_special_path(cmd.strip()[3:].strip())
+    cmd = expand_special_path(cmd)
+    if cmd.strip().lower().startswith('cd '):
+        target = resolve_path(cmd.strip()[3:])
         try:
             os.chdir(target)
-            return f"[Directory changed to {os.getcwd()}]"
+            return f"[Каталог изменен на {os.getcwd()}]"
         except Exception as e:
             return f"[ERROR] {e}"
     try:
+        env = os.environ.copy()
+        env['DESKTOP'] = get_desktop()
         if IS_WINDOWS:
             full_cmd = f'chcp 65001 >nul 2>&1 & {cmd}'
-            r = subprocess.run(
-                ['cmd.exe', '/c', full_cmd],
-                capture_output=True, text=True,
-                timeout=30, encoding='utf-8', errors='replace',
-                env=command_env()
-            )
+            r = subprocess.run(['cmd.exe', '/c', full_cmd], capture_output=True, text=True, timeout=45, encoding='utf-8', errors='replace', env=env)
         else:
-            shell_exe = os.environ.get('SHELL')
-            if shell_exe and not os.path.exists(shell_exe):
-                shell_exe = None
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                               timeout=30, encoding='utf-8', errors='replace',
-                               env=command_env(), executable=shell_exe)
-        out = r.stdout.strip()
-        err = r.stderr.strip()
-        return (out + ('\n' + err if err else '')) or '[Command executed successfully]'
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=45, encoding='utf-8', errors='replace', env=env)
+        out = (r.stdout + ('\n' + r.stderr if r.stderr else '')).strip()
+        return out or '[Успешно выполнено]'
     except subprocess.TimeoutExpired:
-        return '[ERROR] Command timed out'
+        return '[ERROR] Таймаут команды (45s)'
     except Exception as e:
         return f'[ERROR] {e}'
 
 def confirm_exec(cmd):
     print()
-    print(f'  {C_YELLOW}⚡  OPENMODEL wants to run:{RESET}')
+    print(f'  {C_YELLOW}⚡ OPENMODEL запрашивает выполнение команды:{RESET}')
+    print(f'    {BG_CODE}{C_TEAL}  $ {cmd}  {RESET}')
     print()
-    cw = min(tw() - 8, 80)
-    print('    ' + BG_CODE + C_TEAL + f'  {cmd:<{cw}}' + RESET)
-    print()
-    ans = input(f'  {C_YELLOW}Execute? (y/n):{RESET}  ').strip().lower()
-    return ans in ('y', 'yes', '1', 'д', 'да')
+    ans = input(f'  {C_YELLOW}Разрешить? (y/N):{RESET}  ').strip().lower()
+    return ans in ('y', 'yes', 'д', 'да')
 
-# ─── File helpers ─────────────────────────────────────────────────────────────
-READ_ONLY_COMMANDS = {
-    'cat', 'cd', 'dir', 'file', 'find', 'grep', 'head', 'ls', 'pwd', 'realpath',
-    'rg', 'sed', 'stat', 'tail', 'tree', 'type', 'wc', 'where', 'which',
-}
+def is_read_only(cmd):
+    verb = cmd.strip().split()[0].lower() if cmd.strip() else ''
+    safe = {'cat', 'ls', 'dir', 'type', 'grep', 'find', 'git', 'pwd', 'head', 'tail', 'stat', 'which'}
+    return verb in safe and '>' not in cmd and '|' not in cmd
 
-READ_ONLY_PREFIXES = (
-    'git status', 'git diff', 'git log', 'git show', 'git branch --show-current',
-    'python -m py_compile ', 'python3 -m py_compile ',
-)
-
-def command_verb(cmd):
-    try:
-        parts = shlex.split(cmd, posix=not IS_WINDOWS)
-        return parts[0].lower() if parts else ''
-    except Exception:
-        return cmd.strip().split(maxsplit=1)[0].lower() if cmd.strip() else ''
-
-def is_read_only_command(cmd):
-    low = cmd.strip().lower()
-    if not low:
-        return True
-    if any(low.startswith(prefix) for prefix in READ_ONLY_PREFIXES):
-        return True
-    if re.search(r'(^|[;&|]\s*)(sudo|rm|mv|cp|chmod|chown|truncate|tee|dd|mkfs|mount|umount|apt|apt-get|dnf|pacman|zypper|pip|pip3|npm|pnpm|yarn|git)\b', low):
-        return False
-    if '>' in low or re.search(r'\b-delete\b|\b-exec\b', low):
-        return False
-    if re.search(r'\bsed\b.*\s-i(\s|$)', low):
-        return False
-    return command_verb(low) in READ_ONLY_COMMANDS
-
-def resolve_path(path, base_dir=None):
-    path = clean_path(expand_special_path(path))
-    if os.path.isabs(path):
-        return path
-    return os.path.join(base_dir or os.getcwd(), path)
-
-def detect_read(text):
-    for p in [
-        r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+['\"](.+?)['\"](?:\s+(?:и\s+)?(.+?))?$",
-        r"read\s+file\s+['\"](.+?)['\"](?:\s+and\s+(.+?))?$",
-        r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+([^\s]+)(?:\s+(?:и\s+)?(.+?))?$",
-        r"(?:read|analyze|explain)\s+(?:file\s+)?([^\s]+\.[\w]+)(?:\s+and\s+(.+?))?$",
-    ]:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip('"\''), (m.group(2).strip() if m.group(2) else None)
-    return None, None
-
-def detect_modify(text):
-    m = re.search(r'(?:измени|modify|change|edit)\s+([^\s]+)\s+(.*)', text, re.IGNORECASE)
-    return (m.group(1).strip('"\''), m.group(2).strip()) if m else (None, None)
-
-def detect_create_project(text):
-    patterns = [
-        r'(?:создай|сделай|напиши|разработай|сгенерируй|create|build|make|init|start|generate|develop|code|write|craete|creet)\s+.{0,50}?\s+(?:по|из|следуя|согласно|используя|на основе|by|from|using|following|with|based on)\s+(?:this\s+|этому?\s+)?(?:prompt|readme|spec|file|description|промту?|промпту?|файлу?|описанию?)?[:\s]*["\'](.+?)["\']',
-        r'(?:создай|сделай|напиши|разработай|сгенерируй|create|build|make|init|start|generate|develop|code|write|craete|creet)\s+.{0,50}?\s+(?:по|из|следуя|согласно|используя|на основе|by|from|using|following|with|based on)\s+(?:this\s+|этому?\s+)?(?:prompt|readme|spec|file|description|промту?|промпту?|файлу?|описанию?)?[:\s]*([^\s"\']+(\.[a-zA-Z]+))',
-    ]
-    for p in patterns:
-        m = re.search(p, text.strip(), re.IGNORECASE)
-        if m:
-            return m.group(1).strip().strip('"\'')
-    return None
-
+# ─── Help & Config Screens ────────────────────────────────────────────────────
 def show_help():
-    W = tw()
+    W = min(tw() - 4, 80)
     print()
-    label = f'  {C_ACCENT}{BOLD}COMMANDS{RESET}'
-    print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
-    print()
+    print(f"  {BOLD}{C_ACCENT}СПИСОК КОМАНД{RESET}")
+    print(f"  {C_DIM_C}{'─' * W}{RESET}")
     cmds = [
-        ('exit / quit',           'Exit OPENMODEL'),
-        ('cls / clear',           'Back to home screen'),
-        ('new',                   'Fresh conversation (reset context)'),
-        ('model',                 'List & switch AI models (Google/OpenRouter)'),
-        ('model <name/num>',      'Switch AI model directly'),
-        ('history',               'Show last 10 conversations'),
-        ('config',                'Show current configuration'),
-        ('reset config',          'Delete config & re-run setup'),
-        ('read file <path>',      'Read & analyse a file with AI'),
-        ('modify <path> <task>',  'Ask AI to edit a file'),
-        ('tab / help / ?',        'Show this help'),
+        ('/model, model',          'Выбор модели стрелками или цифрами 1-9'),
+        ('/new, new',              'Начать новый диалог (очистить память)'),
+        ('/clear, /cls, cls',      'Очистить терминал и показать инфо-панель'),
+        ('/reset, reset config',   'Сбросить настройки и запустить мастер'),
+        ('/history',               'Показать историю последних диалогов'),
+        ('/config',                'Показать текущие настройки'),
+        ('/exit, quit',            'Выход из программы'),
     ]
-    ml = max(len(k) for k, _ in cmds)
     for k, v in cmds:
-        print(f'  {C_ACCENT}{k:<{ml + 2}}{RESET}  {DIM}{C_GRAY}{v}{RESET}')
-    print()
-
-def show_history():
-    chat_c.execute('SELECT user_input, ai_response, timestamp FROM chats ORDER BY id DESC LIMIT 10')
-    rows = chat_c.fetchall()
-    if not rows:
-        print(f'\n  {C_GRAY}No history yet.{RESET}\n')
-        return
-    W = tw()
-    print()
-    label = f'  {C_ACCENT}{BOLD}HISTORY{RESET}  {DIM}{C_GRAY}last 10{RESET}'
-    print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
-    for u, a, ts in reversed(rows):
-        print()
-        print(f'  {DIM}{C_GRAY}{ts}{RESET}')
-        print(f'  {C_ACCENT}You:{RESET}  {C_WHITE}{u[:120]}{RESET}')
-        print(f'  {C_ACCENT2}AI: {RESET}  {C_GRAY}{(a or "")[:180].replace(chr(10), " ")}{RESET}')
-    print()
+        print(f"  {C_ACCENT}{k:<24}{RESET} {C_WHITE}{v}{RESET}")
+    print(f"  {C_DIM_C}{'─' * W}{RESET}\n")
 
 def show_config():
-    W = tw()
+    W = min(tw() - 4, 80)
     print()
-    label = f'  {C_ACCENT}{BOLD}CONFIG{RESET}'
-    print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
-    print()
-    provider_name = 'Google AI Studio' if is_google_key(api_key) else 'OpenRouter'
-    key_disp = api_key
-    sp_prev  = (system_prompt[:72] + '…') if len(system_prompt) > 72 \
-               else (system_prompt or f'{DIM}{C_GRAY}(default){RESET}')
-    rows = [
-        ('Provider',      provider_name),
-        ('API key',       key_disp),
-        ('Model',         model_name),
-        ('Nickname',      nickname),
-        ('System prompt', sp_prev),
-        ('API status',    (C_GREEN + '● online' if API_AVAILABLE else C_RED + '● offline') + RESET),
-    ]
-    ml = max(len(k) for k, _ in rows)
-    for k, v in rows:
-        print(f'  {C_GRAY}{k:<{ml + 2}}{RESET}  {C_WHITE}{v}{RESET}')
-    print()
+    print(f"  {BOLD}{C_ACCENT}КОНФИГУРАЦИЯ{RESET}")
+    print(f"  {C_DIM_C}{'─' * W}{RESET}")
+    prov = "Google AI Studio" if is_google_key(api_key) else "OpenRouter AI"
+    print(f"  {C_GRAY}Провайдер:{RESET}     {C_WHITE}{prov}{RESET}")
+    print(f"  {C_GRAY}Модель:{RESET}        {BOLD}{C_ACCENT}{model_name}{RESET}")
+    print(f"  {C_GRAY}Никнейм:{RESET}       {C_WHITE}{nickname}{RESET}")
+    print(f"  {C_GRAY}Рабочая папка:{RESET} {C_WHITE}{os.getcwd()}{RESET}")
+    print(f"  {C_GRAY}API Статус:{RESET}    {C_GREEN if API_AVAILABLE else C_RED}● {'Онлайн' if API_AVAILABLE else 'Офлайн'}{RESET}")
+    print(f"  {C_DIM_C}{'─' * W}{RESET}\n")
 
-# ─── Main loop ────────────────────────────────────────────────────────────────
+# ─── Main Execution Loop ──────────────────────────────────────────────────────
 def main():
-    global model_name, API_AVAILABLE
+    global model_name, api_key, nickname, system_prompt, API_AVAILABLE
 
     conversation: list[dict] = []
-    msg_count = 0
-
     render_home(model_name, API_AVAILABLE)
 
     while True:
         try:
             user_input = read_input(nickname)
         except (EOFError, KeyboardInterrupt):
-            print(f'\n\n  {DIM}{C_GRAY}Goodbye.{RESET}\n')
+            print(f'\n\n  {DIM}{C_GRAY}Сессия завершена.{RESET}\n')
             break
 
         if not user_input:
             continue
 
-        lower = user_input.lower()
+        raw = user_input.strip()
+        low = raw.lower()
+        cmd_token = low.lstrip('/')
 
-        if lower in ('exit', 'quit', 'q'):
-            print(f'\n  {DIM}{C_GRAY}Goodbye.{RESET}\n')
+        # ── 1. Intercept Local System Commands ────────────────────────────────
+        if cmd_token in ('exit', 'quit', 'q', ':q'):
+            print(f'\n  {DIM}{C_GRAY}До свидания!{RESET}\n')
             break
 
-        if lower in ('cls', 'clear'):
+        if cmd_token in ('cls', 'clear'):
             render_home(model_name, API_AVAILABLE)
             continue
 
-        if lower == 'new':
+        if cmd_token == 'new':
             conversation.clear()
-            msg_count = 0
             render_home(model_name, API_AVAILABLE)
-            print()
-            center_print(C_GREEN + '✓  New conversation started' + RESET)
-            print()
+            print(f"  {C_GREEN}✓ Память диалога очищена.{RESET}\n")
             continue
 
-        if lower in ('tab', 'help', '?'):
+        if cmd_token in ('help', 'tab', '?'):
             show_help()
             continue
 
-        if lower == 'history':
-            show_history()
-            continue
-
-        if lower == 'config':
+        if cmd_token == 'config':
             show_config()
             continue
 
-        if lower == 'reset config':
+        if cmd_token in ('reset', 'reset config'):
             c.execute('DELETE FROM config WHERE id=1')
             conn.commit()
-            print(f'\n  {C_YELLOW}Config deleted. Restart to re-run setup.{RESET}\n')
-            time.sleep(1.5)
-            break
-
-        if lower == 'model' or lower.startswith('model '):
-            arg = user_input[5:].strip()
-            if not arg and is_google_key(api_key):
-                new_model = select_google_model_interactive(api_key, default=model_name)
-                model_name = new_model
-                c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
-                conn.commit()
-                print(f'\n  {C_GREEN}✓{RESET}  Model switched → {C_ACCENT}{model_name}{RESET}\n')
-            elif arg:
-                if is_google_key(api_key) and arg.isdigit():
-                    models = fetch_google_models(api_key)
-                    val = int(arg)
-                    if 1 <= val <= len(models):
-                        model_name = models[val - 1]['id']
-                    else:
-                        print(f'\n  {C_RED}✗ Invalid number.{RESET}\n')
-                        continue
-                else:
-                    model_name = arg
-                c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
-                conn.commit()
-                print(f'\n  {C_GREEN}✓{RESET}  Model → {C_ACCENT}{model_name}{RESET}\n')
-            else:
-                print(f'\n  {C_RED}Usage: model <model-name-or-number>{RESET}\n')
+            print(f"\n  {C_YELLOW}✓ Конфигурация сброшена.{RESET}")
+            time.sleep(0.8)
+            api_key, model_name, nickname, system_prompt = setup_wizard()
+            conversation.clear()
+            API_AVAILABLE = check_api()
+            render_home(model_name, API_AVAILABLE)
             continue
 
-        if lower.startswith('cd '):
-            new_dir = expand_special_path(user_input[3:].strip())
+        if cmd_token == 'history':
+            chat_c.execute('SELECT user_input, ai_response, timestamp FROM chats ORDER BY id DESC LIMIT 5')
+            rows = chat_c.fetchall()
+            print()
+            for u, a, ts in reversed(rows):
+                print(f"  {DIM}{C_GRAY}[{ts}]{RESET} {C_ACCENT}{nickname}:{RESET} {u[:80]}")
+                print(f"  {C_ACCENT2}AI:{RESET} {DIM}{strip_ansi(a or '')[:120].replace(chr(10), ' ')}{RESET}\n")
+            continue
+
+        if cmd_token == 'model' or cmd_token.startswith('model '):
+            arg = raw.split(' ', 1)[1].strip() if ' ' in raw else ''
+            if not arg:
+                new_mdl = select_model_menu(model_name)
+                if new_mdl and new_mdl != model_name:
+                    model_name = new_mdl
+                    c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
+                    conn.commit()
+                render_home(model_name, API_AVAILABLE)
+                print(f"  {C_GREEN}✓ Модель изменена на:{RESET} {BOLD}{C_ACCENT}{model_name}{RESET}\n")
+            else:
+                model_name = arg
+                c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
+                conn.commit()
+                print(f"\n  {C_GREEN}✓ Модель установлена:{RESET} {BOLD}{C_ACCENT}{model_name}{RESET}\n")
+            continue
+
+        if cmd_token.startswith('cd '):
+            new_dir = resolve_path(raw[3:])
             try:
                 os.chdir(new_dir)
-                print(f'\n  {C_GREEN}✓{RESET}  Changed directory to: {C_ACCENT}{os.getcwd()}{RESET}\n')
+                print(f'\n  {C_GREEN}✓ Текущая папка:{RESET} {C_ACCENT}{os.getcwd()}{RESET}\n')
             except Exception as e:
-                print(f'\n  {C_RED}✗  Cannot change directory: {e}{RESET}\n')
+                print(f'\n  {C_RED}✗ Ошибка смены папки: {e}{RESET}\n')
             continue
 
-        # ── Create project by prompt ───────────────────────────────────────────
-        proj_path = detect_create_project(user_input)
-        if proj_path:
-            proj_path = resolve_path(proj_path.strip())
-            if not os.path.exists(proj_path):
-                print(f'\n  {C_RED}✗  File not found: {proj_path}{RESET}\n')
-                continue
+        # ── 2. AI Request Loop (Only non-command messages reach here) ─────────
+        conversation.append({'role': 'user', 'content': raw})
 
+        for _ in range(5):
+            control = {}
             try:
-                prompt_content = open(proj_path, encoding='utf-8', errors='replace').read()
-            except Exception as e:
-                print(f'\n  {C_RED}✗  Cannot read file: {e}{RESET}\n')
-                continue
-
-            project_dir = os.path.dirname(os.path.abspath(proj_path))
-
-            project_sys = (
-                "You are an expert software developer. "
-                "The user has provided a project specification/README. "
-                "Your job is to fully implement the project described. "
-                "To create a file, you MUST use exactly this format:\n"
-                "[NEW_FILE: path/relative/to/project]\n...content...\n[/NEW_FILE]\n"
-                "Directories are created automatically, do NOT use [CMD] mkdir.\n"
-                "Do NOT wrap the file content in markdown code blocks. Use RAW text only!\n"
-                "For every shell command to run (install deps, init git, etc.), use [CMD]command[/CMD]. "
-                "In [CMD] blocks, use paths relative to the project directory or absolute paths. "
-                f"Commands run on {os_label()} using {shell_label()}. {shell_guidance()} "
-                "Do NOT ask clarifying questions — implement everything described. "
-                "Use markdown in explanations only, not inside file content tags."
-            )
-            build_prompt = (
-                f"PROJECT DIRECTORY: {project_dir}\n\n"
-                f"SPECIFICATION:\n```\n{prompt_content}\n```\n\n"
-                "Implement this project fully. Create all necessary files and run all needed commands."
-            )
-
-            try:
-                control = {}
-                full = print_ai_stream(
-                    stream_ai(
-                        [{'role': 'user', 'content': build_prompt}],
-                        extra_system=project_sys,
-                        control=control
-                    ),
-                    model_name,
-                    control
-                )
-
-                for rel_path, content in re.findall(
-                        r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|CMD))|\Z)', full, re.DOTALL):
-                    rel_path = clean_path(expand_special_path(rel_path))
-                    if is_dummy_path(rel_path): continue
-                    abs_path = resolve_path(rel_path, project_dir)
-                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                    open(abs_path, 'w', encoding='utf-8').write(clean_content(content) + '\n')
-                    print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{abs_path}{RESET}\n')
-
-                for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
-                    cmd = cmd.strip()
-                    if not cmd:
-                        continue
-                    orig_cwd = os.getcwd()
-                    try:
-                        os.chdir(project_dir)
-                        out = execute_command(cmd)
-                    finally:
-                        os.chdir(orig_cwd)
-                    if out and out != '[Command executed successfully]':
-                        print(f'\n    {C_GRAY}{out[:400]}{RESET}\n')
-
-                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
-                               (user_input, full))
-                chat_conn.commit()
-            except RequestCancelled:
-                pass
-            except Exception as e:
-                print(f'\n  {C_RED}Error: {e}{RESET}\n')
-            continue
-
-        # ── File read ──────────────────────────────────────────────────────────
-        fp, inst = detect_read(user_input)
-        if fp:
-            fp = resolve_path(fp)
-            if not os.path.exists(fp):
-                print(f'\n  {C_RED}✗  File not found: {fp}{RESET}\n')
-                continue
-            try:
-                content = open(fp, encoding='utf-8', errors='replace').read()
-                task    = inst or 'Summarize this file and explain what it does.'
-                sys_m   = ('You are a code analysis assistant. '
-                           'Use clear markdown formatting. No [CMD] tags.')
-                prompt  = f'FILE PATH: {fp}\n\nCONTENT:\n```\n{content}\n```\n\nTASK: {task}'
-                control = {}
-                full    = print_ai_stream(
-                    stream_ai([{'role': 'user', 'content': prompt}],
-                              extra_system=sys_m, control=control),
-                    model_name, control)
-                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
-                               (user_input, full))
-                chat_conn.commit()
-            except RequestCancelled:
-                pass
-            except Exception as e:
-                print(f'\n  {C_RED}Error: {e}{RESET}\n')
-            continue
-
-        # ── File modify ────────────────────────────────────────────────────────
-        mfp, mtask = detect_modify(user_input)
-        if mfp and mtask:
-            mfp = resolve_path(mfp)
-            if not os.path.exists(mfp):
-                print(f'\n  {C_RED}✗  File not found: {mfp}{RESET}\n')
-                continue
-            try:
-                orig   = open(mfp, encoding='utf-8', errors='replace').read()
-                prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
-                          f'REQUEST: {mtask}\n\n'
-                          'Modified file → [EDIT_FILE: path]...[/EDIT_FILE]\n'
-                          'New file → [NEW_FILE: path]...[/NEW_FILE] (Directories are created automatically)\n'
-                          'Do NOT wrap code inside tags with ``` blocks. Use RAW text.\n'
-                          'Shell cmd → [CMD]cmd[/CMD]')
-                control = {}
-                full = print_ai_stream(
-                    stream_ai([{'role': 'user', 'content': prompt}], control=control),
-                    model_name, control)
-                
-                m_old = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
-                if m_old:
-                    open(mfp, 'w', encoding='utf-8').write(clean_content(m_old.group(1)) + '\n')
-                    print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{mfp}{RESET}\n')
-                
-                for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                    efp = clean_path(expand_special_path(efp))
-                    if is_dummy_path(efp): continue
-                    efp = resolve_path(efp, os.path.dirname(os.path.abspath(mfp)))
-                    os.makedirs(os.path.dirname(efp), exist_ok=True)
-                    open(efp, 'w', encoding='utf-8').write(clean_content(ec) + '\n')
-                    print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
-
-                for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                    nfp = clean_path(expand_special_path(nfp))
-                    if is_dummy_path(nfp): continue
-                    nfp = resolve_path(nfp, os.path.dirname(os.path.abspath(mfp)))
-                    os.makedirs(os.path.dirname(nfp), exist_ok=True)
-                    open(nfp, 'w', encoding='utf-8').write(clean_content(nc) + '\n')
-                    print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
-                for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
-                    cmd = cmd.strip()
-                    if cmd and confirm_exec(cmd):
-                        out = execute_command(cmd)
-                        print(f'\n    {C_GRAY}{out}{RESET}\n')
-                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
-                               (user_input, full))
-                chat_conn.commit()
-            except RequestCancelled:
-                pass
-            except Exception as e:
-                print(f'\n  {C_RED}Error: {e}{RESET}\n')
-            continue
-
-        # ── Normal multi-turn chat ─────────────────────────────────────────────
-        conversation.append({'role': 'user', 'content': user_input})
-        msg_count += 1
-
-        agent_loop_count = 0
-        while agent_loop_count < 5:
-            agent_loop_count += 1
-            full = ''
-            try:
-                control = {}
-                full = print_ai_stream(
-                    stream_ai(conversation, control=control),
-                    model_name,
-                    control
-                )
+                full = print_ai_stream(stream_ai(conversation, control=control), model_name, control)
             except RequestCancelled:
                 conversation.pop()
-                msg_count -= 1
                 break
             except KeyboardInterrupt:
-                print(f'\n  {C_GRAY}[Cancelled]{RESET}\n')
+                print(f'\n  {C_GRAY}[Прервано]{RESET}\n')
                 conversation.pop()
-                msg_count -= 1
                 break
 
-            if full:
-                conversation.append({'role': 'assistant', 'content': full})
+            if not full:
+                break
 
-            for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                nfp = clean_path(expand_special_path(nfp))
-                if is_dummy_path(nfp): continue
-                nfp = resolve_path(nfp)
-                try:
-                    os.makedirs(os.path.dirname(nfp), exist_ok=True)
-                    open(nfp, 'w', encoding='utf-8').write(clean_content(nc) + '\n')
-                    print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
-                except Exception as e:
-                    print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
+            conversation.append({'role': 'assistant', 'content': full})
 
-            for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                efp = clean_path(expand_special_path(efp))
-                if is_dummy_path(efp): continue
-                efp = resolve_path(efp)
-                try:
-                    os.makedirs(os.path.dirname(efp), exist_ok=True)
-                    open(efp, 'w', encoding='utf-8').write(clean_content(ec) + '\n')
-                    print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
-                except Exception as e:
-                    print(f'  {C_RED}✗  Could not update {efp}: {e}{RESET}\n')
+            # Handle File Creations
+            for match in re.finditer(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|\Z)', full, re.DOTALL):
+                f_path = resolve_path(match.group(1).strip())
+                new_c = clean_content(match.group(2))
+                old_c = ""
+                if os.path.exists(f_path):
+                    try: old_c = open(f_path, 'r', encoding='utf-8', errors='replace').read()
+                    except: pass
+                os.makedirs(os.path.dirname(f_path) or '.', exist_ok=True)
+                with open(f_path, 'w', encoding='utf-8') as f:
+                    f.write(new_c + '\n')
+                display_file_diff(f_path, old_c, new_c, is_new=not bool(old_c))
 
-            cmds = re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL)
+            # Handle File Modifications
+            for match in re.finditer(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|\Z)', full, re.DOTALL):
+                f_path = resolve_path(match.group(1).strip())
+                new_c = clean_content(match.group(2))
+                old_c = ""
+                if os.path.exists(f_path):
+                    try: old_c = open(f_path, 'r', encoding='utf-8', errors='replace').read()
+                    except: pass
+                os.makedirs(os.path.dirname(f_path) or '.', exist_ok=True)
+                with open(f_path, 'w', encoding='utf-8') as f:
+                    f.write(new_c + '\n')
+                display_file_diff(f_path, old_c, new_c, is_new=False)
+
+            # Handle Commands
+            cmds = [m.strip() for m in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL) if m.strip()]
             if not cmds:
-                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
-                               (user_input, full))
+                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)', (raw, full))
                 chat_conn.commit()
                 break
 
-            cmd_results = []
+            cmd_outputs = []
             for cmd in cmds:
-                cmd = cmd.strip()
-                if not cmd: continue
-                if is_read_only_command(cmd):
+                if is_read_only(cmd) or confirm_exec(cmd):
                     out = execute_command(cmd)
-                    cmd_results.append(f"Result of `{cmd}`:\n```\n{out}\n```")
+                    print(f"    {C_GRAY}{out[:300]}{RESET}\n")
+                    cmd_outputs.append(f"Результат `{cmd}`:\n```\n{out}\n```")
                 else:
-                    if confirm_exec(cmd):
-                        out = execute_command(cmd)
-                        print(f'\n    {C_GRAY}{out}{RESET}\n')
-                        cmd_results.append(f"Result of `{cmd}`:\n```\n{out}\n```")
-                    else:
-                        cmd_results.append(f"Result of `{cmd}`: [USER DENIED EXECUTION]")
-            
-            if cmd_results:
-                msg = "Command outputs:\n" + "\n\n".join(cmd_results)
-                conversation.append({'role': 'user', 'content': msg})
-                msg_count += 1
-                continue
+                    cmd_outputs.append(f"Команда `{cmd}` отклонена пользователем.")
+
+            if cmd_outputs:
+                conversation.append({'role': 'user', 'content': "Результаты команд:\n" + "\n\n".join(cmd_outputs)})
+            else:
+                break
 
     conn.close()
     chat_conn.close()
